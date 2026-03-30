@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+*.so
+.ipynb_checkpoints
+.env
+.venv
+venv/
+.vscode/
+.idea/
+.claude/
+
+# Trained models & checkpoints
+models/
+
+# KITTI dataset
+2011_09_26/
+2011_09_28/
+2011_09_29/
+2011_09_30/
+2011_10_03/
+kitti_c/
+kitti_c.zip
+nyu_data/
+drivingstereo_weather/
+
+# Wandb logs
+wandb/
+
+splits/eigen/gt_depths.npz
