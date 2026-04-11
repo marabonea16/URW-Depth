@@ -206,6 +206,14 @@ class MonodepthOptions:
                                  type=int,
                                  help="epoch to resume training from (use with --load_weights_folder)",
                                  default=0)
+        self.parser.add_argument("--uncert_weight",
+                                 type=float,
+                                 help="weight for uncertainty regularization term (lambda * sigma)",
+                                 default=0.5)
+        self.parser.add_argument("--uncert_smoothness",
+                                 type=float,
+                                 help="weight for edge-aware uncertainty smoothness loss",
+                                 default=1e-3)
         self.parser.add_argument("--use_wandb",
                                  help="if set, log training metrics to Weights & Biases",
                                  action="store_true")

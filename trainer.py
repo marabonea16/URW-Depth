@@ -48,7 +48,6 @@ class Trainer:
         self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name)
         self.use_wandb = bool(getattr(self.opt, "use_wandb", False))
         self.use_amp = bool(getattr(self.opt, "use_amp", False)) and not self.opt.no_cuda
-        self.accum_steps = max(1, int(getattr(self.opt, "accum_steps", 1)))
         self.use_activation_checkpoint = bool(getattr(self.opt, "use_activation_checkpoint", False))
 
         # checking height and width are multiples of 32
@@ -76,12 +75,7 @@ class Trainer:
 
 
 
-        self.models["encoder"] = networks.build_model(
-            self.config,
-            img_width=self.opt.width,
-            img_height=self.opt.height,
-            use_checkpoint=self.use_activation_checkpoint
-        )
+        self.models["encoder"] = networks.build_model(self.config)
         self.models["encoder"].to(self.device)
         self.parameters_to_train += list(self.models["encoder"].parameters())
 
@@ -140,7 +134,6 @@ class Trainer:
         self.model_optimizer = optim.Adam(self.parameters_to_train, self.opt.learning_rate)
         self.model_lr_scheduler = optim.lr_scheduler.StepLR(
             self.model_optimizer, self.opt.scheduler_step_size, 0.1)
-        self.grad_scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
         # self.model_lr_scheduler = optim.lr_scheduler.MultiStepLR(
         #     self.model_optimizer, [15,20], 0.3)
 
@@ -150,9 +143,6 @@ class Trainer:
         print("Training model named:\n  ", self.opt.model_name)
         print("Models and tensorboard events files are saved to:\n  ", self.opt.log_dir)
         print("Training is using:\n  ", self.device)
-        print("AMP enabled:\n  ", self.use_amp)
-        print("Gradient accumulation steps:\n  ", self.accum_steps)
-        print("Activation checkpointing:\n  ", self.use_activation_checkpoint)
 
         # data
         datasets_dict = {"kitti": datasets.KITTIRAWDataset,
@@ -214,19 +204,15 @@ class Trainer:
         print("There are {:d} training items and {:d} validation items\n".format(
             len(train_dataset), len(val_dataset)))
 
-        if self.use_wandb:
-            if wandb is None:
-                raise ImportError(
-                    "Requested --use_wandb but wandb is not installed. Install with `pip install wandb`."
-                )
+        self.save_opts()
+
+        if self.use_wandb and wandb is not None:
             wandb.init(
                 project=self.opt.wandb_project,
-                entity=self.opt.wandb_entity,
-                name=self.opt.wandb_run_name if self.opt.wandb_run_name else self.opt.model_name,
+                entity=getattr(self.opt, "wandb_entity", None),
+                name=self.opt.wandb_run_name if getattr(self.opt, "wandb_run_name", None) else self.opt.model_name,
                 config=vars(self.opt),
             )
-
-        self.save_opts()
 
     def set_train(self):
         """Convert all models to training mode
@@ -250,7 +236,7 @@ class Trainer:
             self.run_epoch(self.epoch)
             if (self.epoch + 1) % self.opt.save_frequency == 0:
                 self.save_model()
-        if self.use_wandb:
+        if self.use_wandb and wandb is not None:
             wandb.finish()
 
     def run_epoch(self, epoch):
@@ -260,32 +246,16 @@ class Trainer:
 
         print("Training")
         self.set_train()
-        self.model_optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, inputs in enumerate(self.train_loader):
 
             before_op_time = time.time()
 
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
-                outputs, losses = self.process_batch(inputs, epoch)
-                loss_for_backprop = losses["loss"] / self.accum_steps
+            outputs, losses = self.process_batch(inputs,epoch)
 
-            if self.use_amp:
-                self.grad_scaler.scale(loss_for_backprop).backward()
-            else:
-                loss_for_backprop.backward()
-
-            do_optimizer_step = (
-                (batch_idx + 1) % self.accum_steps == 0 or
-                (batch_idx + 1) == len(self.train_loader)
-            )
-            if do_optimizer_step:
-                if self.use_amp:
-                    self.grad_scaler.step(self.model_optimizer)
-                    self.grad_scaler.update()
-                else:
-                    self.model_optimizer.step()
-                self.model_optimizer.zero_grad(set_to_none=True)
+            self.model_optimizer.zero_grad()
+            losses["loss"].backward()
+            self.model_optimizer.step()
 
             duration = time.time() - before_op_time
 
@@ -295,7 +265,7 @@ class Trainer:
 
             if early_phase or late_phase:
                 self.log_time(batch_idx, duration, losses["loss_HiS"].cpu().data, losses["loss_MiS"].cpu().data, losses["loss_LoS"].cpu().data, losses["loss_consis_HiS"].cpu().data, losses["loss_consis_LoS"].cpu().data, losses["loss"].cpu().data)
-                if self.use_wandb:
+                if self.use_wandb and wandb is not None:
                     wandb.log(
                         {
                             "epoch": int(self.epoch),
@@ -311,7 +281,6 @@ class Trainer:
                             "train/uncert_LoS_mean": float(losses["uncert_LoS_mean"].cpu().item()),
                             "train/lr": float(self.model_optimizer.state_dict()["param_groups"][0]["lr"]),
                             "train/samples_per_sec": float(self.opt.batch_size / duration),
-                            "train/accum_steps": int(self.accum_steps),
                         },
                         step=self.step,
                     )
@@ -565,15 +534,14 @@ class Trainer:
     def compute_normal_ranking_loss(self, tgt_img, pred_disp, target_disp, intrinsics):
         """Computes normal loss between a batch of predicted and target images
         """
-        if LossF is None:
-            raise ImportError(
-                "normal_ranking_loss requested, but `loss_function.py` is not available."
-            )
         #print("pred_disp size", pred_disp.size())
         _, pred_depth = disp_to_depth(pred_disp, self.opt.min_depth, self.opt.max_depth)
         pred_depth_normal = depth_to_normals(pred_depth, intrinsics)
         _, target_depth = disp_to_depth(target_disp, self.opt.min_depth, self.opt.max_depth)
         target_depth_normal = depth_to_normals(target_depth, intrinsics)
+
+        if LossF is None:
+            raise ImportError("normal_ranking_loss requested, but loss_function.py is missing.")
 
         loss = LossF.normal_ranking_loss(target_depth, tgt_img, pred_depth_normal, target_depth_normal)
 
@@ -731,33 +699,47 @@ class Trainer:
             mask4consis[idxs_MiS == 1] = 0
             mask4consis = mask4consis.unsqueeze(1).detach() #[12,1,192,640]
 
-            #smoothness loss + uncertainty-weighted photometric loss (Kendall & Gal)
-            uncert_HiS = F.interpolate(
+            # uncertainty-weighted photometric loss:
+            # loss = (1 - sigma.detach()) * photometric * uncert_mask + lambda * sigma
+            # sigma = sigmoid(uncert) in [0,1]: mare = nesigur, mic = sigur
+            # sigma.detach() separa invatarea uncertainty de depth
+            # uncert_mask: ignora pixelii cu sigma > 0.8 (uncertainty-guided automasking)
+            sigma_HiS = torch.sigmoid(F.interpolate(
                 outputs["out_HiS"][("uncert", 0)], [self.opt.height, self.opt.width],
-                mode="bilinear", align_corners=False).clamp(-10, 10)
-            loss_HiS += (torch.exp(-uncert_HiS) * to_optimise_HiS.unsqueeze(1) + F.softplus(uncert_HiS)).mean()
+                mode="bilinear", align_corners=False))
+            uncert_mask_HiS = (sigma_HiS < 0.8).float()
+            loss_HiS += ((1.0 - sigma_HiS.detach()) * to_optimise_HiS.unsqueeze(1) * uncert_mask_HiS + self.opt.uncert_weight * sigma_HiS).mean()
             mean_disp_HiS = disp_HiS.mean(2, True).mean(3, True)
             norm_disp_HiS = disp_HiS / (mean_disp_HiS + 1e-7)
             smooth_loss_HiS = get_smooth_loss(norm_disp_HiS, color_HiS)
             loss_HiS += self.opt.disparity_smoothness * smooth_loss_HiS
+            loss_HiS += self.opt.uncert_smoothness * get_smooth_loss(sigma_HiS, color_HiS)
 
-            uncert_MiS = F.interpolate(
+            sigma_MiS = torch.sigmoid(F.interpolate(
                 outputs["out_MiS"][("uncert", 0)], [self.opt.height, self.opt.width],
-                mode="bilinear", align_corners=False).clamp(-10, 10)
-            loss_MiS += (torch.exp(-uncert_MiS) * to_optimise_MiS.unsqueeze(1) + F.softplus(uncert_MiS)).mean()
+                mode="bilinear", align_corners=False))
+            uncert_mask_MiS = (sigma_MiS < 0.8).float()
+            loss_MiS += ((1.0 - sigma_MiS.detach()) * to_optimise_MiS.unsqueeze(1) * uncert_mask_MiS + self.opt.uncert_weight * sigma_MiS).mean()
             mean_disp_MiS = disp_MiS.mean(2, True).mean(3, True)
             norm_disp_MiS = disp_MiS / (mean_disp_MiS + 1e-7)
             smooth_loss_MiS = get_smooth_loss(norm_disp_MiS, color_MiS)
             loss_MiS += self.opt.disparity_smoothness * smooth_loss_MiS
+            loss_MiS += self.opt.uncert_smoothness * get_smooth_loss(sigma_MiS, color_MiS)
 
-            uncert_LoS = F.interpolate(
+            sigma_LoS = torch.sigmoid(F.interpolate(
                 outputs["out_LoS"][("uncert", 0)], [self.opt.height, self.opt.width],
-                mode="bilinear", align_corners=False).clamp(-10, 10)
-            loss_LoS += (torch.exp(-uncert_LoS) * to_optimise_LoS.unsqueeze(1) + F.softplus(uncert_LoS)).mean()
+                mode="bilinear", align_corners=False))
+            uncert_mask_LoS = (sigma_LoS < 0.8).float()
+            loss_LoS += ((1.0 - sigma_LoS.detach()) * to_optimise_LoS.unsqueeze(1) * uncert_mask_LoS + self.opt.uncert_weight * sigma_LoS).mean()
             mean_disp_LoS = disp_LoS.mean(2, True).mean(3, True)
             norm_disp_LoS = disp_LoS / (mean_disp_LoS + 1e-7)
             smooth_loss_LoS = get_smooth_loss(norm_disp_LoS, color_LoS)
             loss_LoS += self.opt.disparity_smoothness * smooth_loss_LoS
+            loss_LoS += self.opt.uncert_smoothness * get_smooth_loss(sigma_LoS, color_LoS)
+
+            # consistenta cross-modal: sigma HiS si MiS ar trebui sa fie similare
+            loss_HiS += self.opt.uncert_smoothness * torch.mean(
+                torch.abs(sigma_HiS - sigma_MiS.detach()))
 
 
             # Lcs0
@@ -812,9 +794,9 @@ class Trainer:
         losses["loss_consis_HiS"] = loss_consis_HiS
         losses["loss_consis_LoS"] = loss_consis_LoS
         with torch.no_grad():
-            losses["uncert_HiS_mean"] = outputs["out_HiS"][("uncert", 0)].mean()
-            losses["uncert_MiS_mean"] = outputs["out_MiS"][("uncert", 0)].mean()
-            losses["uncert_LoS_mean"] = outputs["out_LoS"][("uncert", 0)].mean()
+            losses["uncert_HiS_mean"] = torch.sigmoid(outputs["out_HiS"][("uncert", 0)]).mean()
+            losses["uncert_MiS_mean"] = torch.sigmoid(outputs["out_MiS"][("uncert", 0)]).mean()
+            losses["uncert_LoS_mean"] = torch.sigmoid(outputs["out_LoS"][("uncert", 0)]).mean()
 
         # print("loss_HiS:",loss_HiS.cpu().data, "loss_MiS:",loss_MiS.cpu().data, "loss_LoS:",loss_LoS.cpu().data, "loss_consis_HiS:",loss_consis_HiS.cpu().data, "loss_consis_LoS:",loss_consis_LoS.cpu().data, "loss:",total_loss.cpu().data)
         return losses
@@ -1062,11 +1044,11 @@ class Trainer:
         save_path = os.path.join(save_folder, "{}.pth".format("adam"))
         torch.save(self.model_optimizer.state_dict(), save_path)
 
-        # update symlink weights_latest -> weights_{epoch}
+        # update symlink weights_latest -> weights_{epoch} (cale absoluta)
         latest_link = os.path.join(self.log_path, "models", "weights_latest")
         if os.path.islink(latest_link):
             os.remove(latest_link)
-        os.symlink(save_folder, latest_link)
+        os.symlink(os.path.abspath(save_folder), latest_link)
         print("  -> saved checkpoint: weights_{} (epoch {})".format(self.epoch, self.epoch))
 
     def load_model(self):

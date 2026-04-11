@@ -20,6 +20,11 @@ import networks
 
 cv2.setNumThreads(0)  # This speeds up evaluation 5x on our unix systems (OpenCV 3.3.1)
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 
 splits_dir = os.path.join(os.path.dirname(__file__), "splits")
 
@@ -115,6 +120,8 @@ def evaluate(opt):
         depth_decoder.eval()
 
         pred_disps = []
+        sample_uncert_maps = []   # primele 8 imagini pentru vizualizare wandb
+        sample_input_imgs = []
 
         print("-> Computing predictions with size {}x{}".format(
             opt.width, opt.height))
@@ -139,6 +146,14 @@ def evaluate(opt):
                     pred_disp = batch_post_process_disparity(pred_disp[:N], pred_disp[N:, :, ::-1])
 
                 pred_disps.append(pred_disp)
+
+                # colecteaza uncertainty maps pentru primele 8 imagini
+                if len(sample_uncert_maps) < 8 and ("uncert", 0) in output:
+                    uncert = output[("uncert", 0)].cpu().numpy()  # [B,1,H,W]
+                    imgs = data[("color_MiS", 0, 0)].numpy()     # [B,3,H,W]
+                    n = min(8 - len(sample_uncert_maps), uncert.shape[0])
+                    sample_uncert_maps.extend(uncert[:n, 0])      # [H,W]
+                    sample_input_imgs.extend(imgs[:n])             # [3,H,W]
 
         pred_disps = np.concatenate(pred_disps)
 
@@ -249,6 +264,42 @@ def evaluate(opt):
     print("\n  " + ("{:>8} | " * 7).format("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
     print(("&{: 8.3f}  " * 7).format(*mean_errors.tolist()) + "\\\\")
     print("\n-> Done!")
+
+    if getattr(opt, "use_wandb", False) and wandb is not None:
+        wandb.init(
+            project=opt.wandb_project,
+            entity=getattr(opt, "wandb_entity", None),
+            name=opt.wandb_run_name if getattr(opt, "wandb_run_name", None) else opt.load_weights_folder,
+            config=vars(opt),
+        )
+
+        log_dict = {
+            "eval/abs_rel":  float(mean_errors[0]),
+            "eval/sq_rel":   float(mean_errors[1]),
+            "eval/rmse":     float(mean_errors[2]),
+            "eval/rmse_log": float(mean_errors[3]),
+            "eval/a1":       float(mean_errors[4]),
+            "eval/a2":       float(mean_errors[5]),
+            "eval/a3":       float(mean_errors[6]),
+        }
+
+        # logheza uncertainty maps ca imagini (colormap viridis)
+        if sample_uncert_maps:
+            uncert_images = []
+            for idx, (u, img) in enumerate(zip(sample_uncert_maps, sample_input_imgs)):
+                # normalizeaza uncertainty in [0,1] si aplica colormap
+                u_norm = (u - u.min()) / (u.max() - u.min() + 1e-8)
+                u_color = cv2.applyColorMap((u_norm * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
+                u_color = cv2.cvtColor(u_color, cv2.COLOR_BGR2RGB)
+                # input image: [3,H,W] -> [H,W,3], denormalize
+                rgb = np.transpose(img, (1, 2, 0))
+                rgb = ((rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8) * 255).astype(np.uint8)
+                combined = np.concatenate([rgb, u_color], axis=1)  # side-by-side
+                uncert_images.append(wandb.Image(combined, caption="input | uncertainty #{}".format(idx)))
+            log_dict["eval/uncertainty_maps"] = uncert_images
+
+        wandb.log(log_dict)
+        wandb.finish()
 
 
 if __name__ == "__main__":

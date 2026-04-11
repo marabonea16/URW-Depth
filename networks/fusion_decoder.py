@@ -89,6 +89,8 @@ class FusionDecoder(nn.Module):
 
         self.convs[("dispconv", 0)] = Conv3x3(64, self.num_output_channels)
         self.convs[("uncertconv", 0)] = Conv3x3(64, self.num_output_channels)
+        # initializeaza bias la -2 -> sigmoid(-2)~0.12: modelul porneste confident
+        nn.init.constant_(self.convs[("uncertconv", 0)].conv.bias, -2.0)
 
 
 

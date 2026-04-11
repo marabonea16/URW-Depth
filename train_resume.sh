@@ -6,7 +6,7 @@
 
 SESSION="train"
 LOG_DIR="models"
-MODEL_NAME="Tiny-Depth-Basic-Uncertainty-Head-2"
+MODEL_NAME="Tiny-Depth-Uncertainty-Guided-Automasking-2"
 WEIGHTS_DIR="$LOG_DIR/$MODEL_NAME/models"
 
 BASE_CMD="CUDA_VISIBLE_DEVICES=0 python train.py \
@@ -25,7 +25,7 @@ BASE_CMD="CUDA_VISIBLE_DEVICES=0 python train.py \
   --num_workers 8 \
   --use_wandb \
   --wandb_project tinydepth \
-  --wandb_run_name tinydepth-basic-uncertainty-head-2"
+  --wandb_run_name tinydepth-uncertainty-guided-automasking-2"
 
 # detecteaza daca trebuie resume
 if [ "$1" == "--resume" ] && [ -L "$WEIGHTS_DIR/weights_latest" ]; then
