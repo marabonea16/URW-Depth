@@ -6,7 +6,7 @@
 
 SESSION="train"
 LOG_DIR="models"
-MODEL_NAME="Tiny-Depth-Weather-Robust-Feature-Supression"
+MODEL_NAME="Tiny-Depth-Weather-Robust"
 WEIGHTS_DIR="$LOG_DIR/$MODEL_NAME/models"
 
 BASE_CMD="CUDA_VISIBLE_DEVICES=0 python train.py \
