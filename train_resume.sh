@@ -6,7 +6,7 @@
 
 SESSION="train"
 LOG_DIR="models"
-MODEL_NAME="Tiny-Depth-Uncertainty-Guided-Automasking-2"
+MODEL_NAME="Tiny-Depth-Weather-Robust-Feature-Supression"
 WEIGHTS_DIR="$LOG_DIR/$MODEL_NAME/models"
 
 BASE_CMD="CUDA_VISIBLE_DEVICES=0 python train.py \
@@ -23,9 +23,11 @@ BASE_CMD="CUDA_VISIBLE_DEVICES=0 python train.py \
   --log_dir $LOG_DIR \
   --data_path /home/ubuntu/TinyDepth \
   --num_workers 8 \
+  --use_weather_aug \
+  --use_feature_suppression \
   --use_wandb \
   --wandb_project tinydepth \
-  --wandb_run_name tinydepth-uncertainty-guided-automasking-2"
+  --wandb_run_name tinydepth-weather-robust"
 
 # detecteaza daca trebuie resume
 if [ "$1" == "--resume" ] && [ -L "$WEIGHTS_DIR/weights_latest" ]; then

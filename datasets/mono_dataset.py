@@ -26,6 +26,72 @@ def pil_loader(path):
             return img.convert('RGB')
 
 
+def apply_fog(img, severity=None):
+    """Simuleaza ceata: blend cu alb, mai intens spre margini (departe)."""
+    if severity is None:
+        severity = random.uniform(0.2, 0.6)
+    arr = np.array(img, dtype=np.float32)
+    fog_color = np.array([220, 220, 220], dtype=np.float32)
+    # gradient vertical: mai multa ceata sus (orizont/distanta)
+    h, w = arr.shape[:2]
+    gradient = np.linspace(severity, severity * 0.3, h, dtype=np.float32)[:, None, None]
+    arr = arr * (1 - gradient) + fog_color * gradient
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+
+def apply_rain(img, severity=None):
+    """Simuleaza ploaie: streaks diagonale semitransparente + contrast redus."""
+    if severity is None:
+        severity = random.uniform(0.3, 0.7)
+    arr = np.array(img, dtype=np.float32)
+    h, w = arr.shape[:2]
+    num_streaks = int(severity * 600)
+    for _ in range(num_streaks):
+        x = random.randint(0, w - 1)
+        y = random.randint(0, h - 20)
+        length = random.randint(10, 25)
+        alpha = random.uniform(0.3, 0.6)
+        for k in range(length):
+            yi = min(y + k, h - 1)
+            xi = min(x + k // 3, w - 1)
+            arr[yi, xi] = arr[yi, xi] * (1 - alpha) + 200 * alpha
+    # reducere contrast
+    arr = arr * (1 - severity * 0.15) + 128 * severity * 0.15
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+
+def apply_snow(img, severity=None):
+    """Simuleaza zapada: puncte albe + desaturare + blur usor."""
+    if severity is None:
+        severity = random.uniform(0.2, 0.5)
+    arr = np.array(img, dtype=np.float32)
+    h, w = arr.shape[:2]
+    # desaturare
+    gray = arr.mean(axis=2, keepdims=True)
+    arr = arr * (1 - severity * 0.4) + gray * severity * 0.4
+    # flakes albe
+    num_flakes = int(severity * 800)
+    ys = np.random.randint(0, h, num_flakes)
+    xs = np.random.randint(0, w, num_flakes)
+    alphas = np.random.uniform(0.5, 1.0, num_flakes)
+    for y, x, a in zip(ys, xs, alphas):
+        arr[y, x] = arr[y, x] * (1 - a) + 255 * a
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+
+def apply_weather_aug(img):
+    """Aplica random unul dintre: fog, rain, snow (cu prob 50% per sample)."""
+    if random.random() > 0.5:
+        return img  # jumatate din imagini raman curate
+    choice = random.randint(0, 2)
+    if choice == 0:
+        return apply_fog(img)
+    elif choice == 1:
+        return apply_rain(img)
+    else:
+        return apply_snow(img)
+
+
 class MonoDataset(data.Dataset):
     """Superclass for monocular dataloaders
 
@@ -47,7 +113,8 @@ class MonoDataset(data.Dataset):
                  frame_idxs,
                  num_scales,
                  is_train=False,
-                 img_ext='.png'):
+                 img_ext='.png',
+                 use_weather_aug=False):
         super(MonoDataset, self).__init__()
 
         self.data_path = data_path
@@ -64,6 +131,7 @@ class MonoDataset(data.Dataset):
 
         self.is_train = is_train
         self.img_ext = img_ext
+        self.use_weather_aug = use_weather_aug
 
         self.loader = pil_loader
         self.to_tensor = transforms.ToTensor()
@@ -226,12 +294,28 @@ class MonoDataset(data.Dataset):
         else:
             side = None
 
+        # weather augmentation: aplica acelasi tip de vreme la toate frame-urile din secventa
+        # (consistent temporal) — 50% din samplete raman curate
+        do_weather_aug = self.is_train and self.use_weather_aug and random.random() > 0.5
+        weather_fn = None
+        if do_weather_aug:
+            choice = random.randint(0, 2)
+            if choice == 0:
+                weather_fn = apply_fog
+            elif choice == 1:
+                weather_fn = apply_rain
+            else:
+                weather_fn = apply_snow
+
         for i in self.frame_idxs:
             if i == "s":
                 other_side = {"r": "l", "l": "r"}[side]
-                inputs[("color", i, -1)] = self.get_color(folder, frame_index, other_side, do_flip)
+                img = self.get_color(folder, frame_index, other_side, do_flip)
             else:
-                inputs[("color", i, -1)] = self.get_color(folder, frame_index + i, side, do_flip)
+                img = self.get_color(folder, frame_index + i, side, do_flip)
+            if weather_fn is not None:
+                img = weather_fn(img)
+            inputs[("color", i, -1)] = img
 
 
         intrinsics = np.delete(self.K, -1, axis=1)

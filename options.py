@@ -58,6 +58,12 @@ class MonodepthOptions:
         self.parser.add_argument("--random_seed",
                                  default=None, type=int)
 
+        self.parser.add_argument("--use_weather_aug",
+                                 help="if set, applies random fog/rain/snow augmentation during training",
+                                 action="store_true")
+        self.parser.add_argument("--use_feature_suppression",
+                                 help="if set, uncertainty suppresses features before disp prediction",
+                                 action="store_true")
         self.parser.add_argument("--model_name",
                                  type=str,
                                  help="the name of the folder to save the model in",

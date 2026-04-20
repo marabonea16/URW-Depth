@@ -106,7 +106,9 @@ def evaluate(opt):
         encoder = networks.build_model(config, img_width=opt.width, img_height=opt.height)
         
 
-        depth_decoder = networks.FusionDecoder(num_ch_enc)
+        depth_decoder = networks.FusionDecoder(
+            num_ch_enc,
+            use_feature_suppression=getattr(opt, "use_feature_suppression", False))
 
 
 

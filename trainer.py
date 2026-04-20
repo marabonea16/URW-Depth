@@ -82,7 +82,9 @@ class Trainer:
 
         num_params_de = sum([np.prod(p.size()) for p in self.models["encoder"].parameters()])
 
-        self.models["depth"] = networks.FusionDecoder(self.num_ch_enc)
+        self.models["depth"] = networks.FusionDecoder(
+            self.num_ch_enc,
+            use_feature_suppression=getattr(self.opt, "use_feature_suppression", False))
 
         self.models["depth"].to(self.device)
         self.parameters_to_train += list(self.models["depth"].parameters())
@@ -160,7 +162,8 @@ class Trainer:
 
         train_dataset = self.dataset(
             self.opt.data_path, train_filenames, self.opt.height, self.opt.width,
-            self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
+            self.opt.frame_ids, 4, is_train=True, img_ext=img_ext,
+            use_weather_aug=getattr(self.opt, "use_weather_aug", False))
         self.train_loader = DataLoader(
             train_dataset, self.opt.batch_size, True,
             num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)

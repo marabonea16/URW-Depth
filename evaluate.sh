@@ -4,7 +4,7 @@
 #   Ultimul checkpoint:  bash evaluate.sh
 #   Checkpoint specific: bash evaluate.sh 42
 
-MODEL_NAME="Tiny-Depth-Uncertainty-Guided-Automasking"
+MODEL_NAME="Tiny-Depth-Weather-Robust"
 LOG_DIR="models"
 WEIGHTS_DIR="$LOG_DIR/$MODEL_NAME/models"
 
@@ -36,6 +36,7 @@ CUDA_VISIBLE_DEVICES=0 python /home/ubuntu/TinyDepth/evaluate_depth.py \
   --data_path /home/ubuntu/TinyDepth \
   --png \
   --eval_split eigen \
+  --use_feature_suppression \
   --use_wandb \
   --wandb_project tinydepth \
   --wandb_run_name "$MODEL_NAME-$(basename $WEIGHTS)"

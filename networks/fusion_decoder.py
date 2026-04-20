@@ -40,10 +40,11 @@ class PWSA(nn.Module):
 
 
 class FusionDecoder(nn.Module):
-    def __init__(self, num_ch_enc, scales=range(4), num_output_channels=1, use_skips=True):
+    def __init__(self, num_ch_enc, scales=range(4), num_output_channels=1, use_skips=True, use_feature_suppression=False):
         super(FusionDecoder, self).__init__()
 
         self.num_output_channels = num_output_channels
+        self.use_feature_suppression = use_feature_suppression
         self.scales = scales
 
         self.num_ch_enc = num_ch_enc        #features in encoder, [16,64,128,160,320]
@@ -173,8 +174,15 @@ class FusionDecoder(nn.Module):
         d = updown_sample(d, 2)
 
 
-        self.outputs[("disp", 0)] = self.sigmoid(self.convs[("dispconv", 0)](d))
         self.outputs[("uncert", 0)] = self.convs[("uncertconv", 0)](d)  # log-variance (raw, no activation)
+        if self.use_feature_suppression:
+            # uncertainty-guided feature suppression:
+            # sigma suprima feature-urile afectate de weather/occlusion inainte de disp
+            sigma = self.sigmoid(self.outputs[("uncert", 0)])
+            d_refined = d * (1.0 - sigma.detach())
+            self.outputs[("disp", 0)] = self.sigmoid(self.convs[("dispconv", 0)](d_refined))
+        else:
+            self.outputs[("disp", 0)] = self.sigmoid(self.convs[("dispconv", 0)](d))
 
 
         return self.outputs
