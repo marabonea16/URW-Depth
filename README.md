@@ -29,6 +29,8 @@ Please consider citing it if you think it is a useful work.
 ## Visualization results on KITTI dataset
 ![](figures/result3.png)
 
+## Pretrain
+Download our network's pre-trained models at different resolutions here [pretrain](https://huggingface.co/czy1102/TinyDepth_pretrain/tree/main); simply unzip and use them.
 
 ## Training:
 
