@@ -9,8 +9,8 @@ MODEL_NAME="Tiny-Depth-Weather-Robust-Feature-Supression"
 LOG_DIR="models"
 WEIGHTS_DIR="$LOG_DIR/$MODEL_NAME/models"
 
-TTA_STEPS=${2:-5}
-TTA_LR=${3:-1e-4}
+TTA_STEPS=${2:-3}
+TTA_LR=${3:-1e-5}
 
 if [ -n "$1" ]; then
     WEIGHTS="$WEIGHTS_DIR/weights_$1"

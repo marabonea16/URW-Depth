@@ -79,9 +79,19 @@ def tta_step(encoder, depth_decoder, pose_encoder, pose_decoder,
     # salveaza starea initiala pentru restaurare dupa
     original_state = copy.deepcopy(depth_decoder.state_dict())
 
-    optimizer = torch.optim.Adam(depth_decoder.parameters(), lr=tta_lr)
+    # actualizeaza doar ultimul strat (dispconv) - cel mai stabil pentru TTA fara BN
+    dispconv_params = list(depth_decoder.convs[("dispconv", 0)].parameters())
+    optimizer = torch.optim.Adam(dispconv_params, lr=tta_lr)
 
     H, W = frame_target.shape[2], frame_target.shape[3]
+    # la evaluare nu exista crop augmentation -> dxy = 0
+    dxy = torch.zeros(1, 2, device=device)
+
+    # predictie initiala (referinta pentru consistency regularization)
+    with torch.no_grad():
+        feats_init = encoder(frame_target)
+        output_init = depth_decoder(feats_init)
+        disp_init = output_init[("disp", 0)][:, 0:1].detach()
 
     for step in range(n_steps):
         optimizer.zero_grad()
@@ -115,8 +125,8 @@ def tta_step(encoder, depth_decoder, pose_encoder, pose_decoder,
         total_loss = torch.tensor(0.0, device=device)
 
         for T, frame_src in [(T_prev, frame_prev), (T_next, frame_next)]:
-            cam_points = backproject(depth, inv_K)
-            pix_coords = project(cam_points, K, T)
+            cam_points = backproject(depth, inv_K, dxy)
+            pix_coords = project(cam_points, K, T, dxy)
             reconstructed = F.grid_sample(
                 frame_src, pix_coords,
                 mode="bilinear", padding_mode="border", align_corners=False)
@@ -129,7 +139,12 @@ def tta_step(encoder, depth_decoder, pose_encoder, pose_decoder,
             reg_loss = (0.1 * sigma).mean()
             total_loss = total_loss + weighted_loss + reg_loss
 
+        # consistency: nu lasa modelul sa se departeze prea mult de predictia initiala
+        consistency_loss = F.l1_loss(disp, disp_init)
+        total_loss = total_loss + 10.0 * consistency_loss
+
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(dispconv_params, max_norm=1.0)
         optimizer.step()
 
     # --- predictie finala cu parametrii adaptati ---
@@ -137,7 +152,7 @@ def tta_step(encoder, depth_decoder, pose_encoder, pose_decoder,
     with torch.no_grad():
         feats_final = encoder(frame_target)
         output_final = depth_decoder(feats_final)
-        disp_final = output_final[("disp", 0)][:, 0:1]
+        disp_final, _ = disp_to_depth(output_final[("disp", 0)][:, 0:1], 0.1, 100.0)
 
     # restaureaza parametrii originali pentru urmatorul sample
     depth_decoder.load_state_dict(original_state)
@@ -149,7 +164,7 @@ def tta_step(encoder, depth_decoder, pose_encoder, pose_decoder,
 def evaluate(opt):
     MIN_DEPTH = 1e-3
     MAX_DEPTH = 80
-    device = torch.device("cuda" if not opt.no_cuda else "cpu")
+    device = torch.device("cuda" if not getattr(opt, "no_cuda", False) else "cpu")
 
     assert opt.eval_mono, "TTA evaluation requires --eval_mono"
 
@@ -197,14 +212,24 @@ def evaluate(opt):
     for p in pose_decoder.parameters():
         p.requires_grad_(False)
 
-    # --- dataset cu frame-uri vecine [-1, 0, 1] ---
+    # --- dataset: incarca doar frame 0 (vecinii se incarc manual cu fallback) ---
     dataset = datasets.KITTIRAWDataset(
         opt.data_path, filenames,
         opt.height, opt.width,
-        [-1, 0, 1], 4, is_train=False, img_ext='.png')
+        [0], 4, is_train=False, img_ext='.png')
     dataloader = DataLoader(dataset, 1, shuffle=False,
-                            num_workers=opt.num_workers,
+                            num_workers=2,
                             pin_memory=True, drop_last=False)
+
+    # dataset auxiliar pentru vecini (cu frame -1 si +1, ignoram erorile)
+    dataset_seq = datasets.KITTIRAWDataset(
+        opt.data_path, filenames,
+        opt.height, opt.width,
+        [-1, 0, 1], 4, is_train=False, img_ext='.png')
+
+    from torchvision import transforms
+    to_tensor = transforms.ToTensor()
+    resize_fn = transforms.Resize((opt.height, opt.width))
 
     # --- geometrie ---
     ssim_fn = SSIM().to(device)
@@ -224,17 +249,31 @@ def evaluate(opt):
 
     for idx, data in enumerate(dataloader):
         frame_target = data[("color_MiS", 0, 0)].to(device)
-        frame_prev   = data[("color_MiS", -1, 0)].to(device)
-        frame_next   = data[("color_MiS", 1, 0)].to(device)
-
-        K    = data[("K_MiS", 0)].to(device).float()
+        K     = data[("K_MiS", 0)].to(device).float()
         inv_K = data[("inv_K_MiS", 0)].to(device).float()
 
-        disp_adapted = tta_step(
-            encoder, depth_decoder, pose_encoder, pose_decoder,
-            frame_target, frame_prev, frame_next,
-            K, inv_K, ssim_fn, backproject, project,
-            tta_lr=opt.tta_lr, n_steps=opt.tta_steps, device=device)
+        # incearca sa incarce vecinii; daca nu exista (frame la margine), skip TTA
+        has_neighbors = True
+        try:
+            seq_data = dataset_seq[idx]
+            frame_prev = seq_data[("color_MiS", -1, 0)].unsqueeze(0).to(device)
+            frame_next = seq_data[("color_MiS",  1, 0)].unsqueeze(0).to(device)
+        except (FileNotFoundError, Exception):
+            has_neighbors = False
+
+        if has_neighbors:
+            disp_adapted = tta_step(
+                encoder, depth_decoder, pose_encoder, pose_decoder,
+                frame_target, frame_prev, frame_next,
+                K, inv_K, ssim_fn, backproject, project,
+                tta_lr=opt.tta_lr, n_steps=opt.tta_steps, device=device)
+        else:
+            # fara vecini: predictie normala fara TTA
+            depth_decoder.eval()
+            with torch.no_grad():
+                out = depth_decoder(encoder(frame_target))
+            disp_adapted, _ = disp_to_depth(out[("disp", 0)][:, 0:1], 0.1, 100.0)
+            depth_decoder.train()
 
         pred_disp = disp_adapted.cpu().numpy()[:, 0]  # [1,H,W]
         pred_disps.append(pred_disp)
@@ -328,6 +367,4 @@ if __name__ == "__main__":
                                 help="numar de pasi gradient la TTA")
     options.parser.add_argument("--tta_lr", type=float, default=1e-4,
                                 help="learning rate pentru TTA")
-    options.parser.add_argument("--no_cuda", action="store_true",
-                                help="daca e setat, foloseste CPU")
     evaluate(options.parse())
