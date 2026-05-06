@@ -4,7 +4,7 @@
 #   Ultimul checkpoint:  bash evaluate.sh
 #   Checkpoint specific: bash evaluate.sh 42
 
-MODEL_NAME="Tiny-Depth-Weather-Robust"
+MODEL_NAME="Tiny-Depth-Weather-Robust-Feature-Supression"
 LOG_DIR="models"
 WEIGHTS_DIR="$LOG_DIR/$MODEL_NAME/models"
 

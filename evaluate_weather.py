@@ -31,8 +31,7 @@ from torch.utils.data import DataLoader
 from PIL import Image
 
 from networks.configuration import get_config
-from layer import (disp_to_depth, BackprojectDepth, Project3D,
-                   SSIM, transformation_from_parameters)
+from layer import disp_to_depth
 from utils import readlines
 from options import MonodepthOptions
 import datasets
@@ -109,24 +108,22 @@ def compute_errors(gt, pred):
     sq_rel   = np.mean(((gt - pred) ** 2) / gt)
     return abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
 
-# ── photometric loss (identic cu trainer.py) ───────────────────────────────────
-
-def compute_photometric_loss(pred, target, ssim_fn):
-    abs_diff = torch.abs(target - pred)
-    l1 = abs_diff.mean(1, True)
-    ssim_loss = ssim_fn(pred, target).mean(1, True)
-    return 0.85 * ssim_loss + 0.15 * l1
-
 # ── TTA step ───────────────────────────────────────────────────────────────────
 
-def tta_step(encoder, depth_decoder, pose_encoder, pose_decoder,
-             frame_target, frame_prev, frame_next,
-             K, inv_K, ssim_fn, backproject, project,
-             tta_lr, n_steps, device):
+def tta_step(encoder, depth_decoder,
+             frame_target,
+             tta_lr, n_steps, device, consistency_weight=1.0):
+    """
+    Uncertainty Minimization TTA:
+    Minimizeaza media sigma (incertitudinea) + consistency fata de predictia initiala.
+    Nu necesita frame-uri vecine sau retea de pose.
+    Pixelii cu sigma mare = afectati de weather -> forteaza predictii mai sigure.
+    """
     original_state = copy.deepcopy(depth_decoder.state_dict())
-    dispconv_params = list(depth_decoder.convs[("dispconv", 0)].parameters())
-    optimizer = torch.optim.Adam(dispconv_params, lr=tta_lr)
-    dxy = torch.zeros(1, 2, device=device)
+    # actualizeaza ambele capete de output
+    tta_params = (list(depth_decoder.convs[("dispconv", 0)].parameters()) +
+                  list(depth_decoder.convs[("uncertconv", 0)].parameters()))
+    optimizer = torch.optim.Adam(tta_params, lr=tta_lr)
 
     with torch.no_grad():
         feats_init = encoder(frame_target)
@@ -139,35 +136,17 @@ def tta_step(encoder, depth_decoder, pose_encoder, pose_decoder,
             feats = encoder(frame_target)
         output = depth_decoder(feats)
 
-        disp   = output[("disp", 0)][:, 0:1]
-        sigma  = torch.sigmoid(output[("uncert", 0)])
-        _, depth = disp_to_depth(disp, 0.1, 100.0)
+        disp  = output[("disp", 0)][:, 0:1]
+        sigma = torch.sigmoid(output[("uncert", 0)])
 
-        # pose t-1 -> t
-        pose_feats_prev = [pose_encoder(torch.cat([frame_prev, frame_target], 1))]
-        ax_p, tr_p = pose_decoder(pose_feats_prev)
-        T_prev = transformation_from_parameters(ax_p[:, 0], tr_p[:, 0], invert=True)
+        # uncertainty minimization: forteaza predictii sigure pe regiunile cu weather
+        uncert_loss = sigma.mean()
+        # consistency: disp nu deriva prea mult de la predictia initiala
+        consist_loss = F.l1_loss(disp, disp_init)
 
-        # pose t+1 -> t
-        pose_feats_next = [pose_encoder(torch.cat([frame_target, frame_next], 1))]
-        ax_n, tr_n = pose_decoder(pose_feats_next)
-        T_next = transformation_from_parameters(ax_n[:, 0], tr_n[:, 0], invert=False)
-
-        total_loss = torch.tensor(0.0, device=device)
-        for T, src in [(T_prev, frame_prev), (T_next, frame_next)]:
-            cam_pts  = backproject(depth, inv_K, dxy)
-            pix_coords = project(cam_pts, K, T, dxy)
-            recon = F.grid_sample(src, pix_coords, mode="bilinear",
-                                  padding_mode="border", align_corners=False)
-            photo = compute_photometric_loss(recon, frame_target, ssim_fn)
-            total_loss = total_loss + ((1.0 - sigma.detach()) * photo).mean()
-            total_loss = total_loss + 0.1 * sigma.mean()
-
-        # consistency: nu lasa disp sa derive prea mult
-        total_loss = total_loss + 10.0 * F.l1_loss(disp, disp_init)
-
+        total_loss = uncert_loss + consistency_weight * consist_loss
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(dispconv_params, max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(tta_params, max_norm=1.0)
         optimizer.step()
 
     depth_decoder.eval()
@@ -238,39 +217,18 @@ def evaluate(opt):
     encoder.to(device).eval()
     for p in encoder.parameters(): p.requires_grad_(False)
 
-    # --- dataset cu weather ---
-    frame_idxs = [-1, 0, 1] if use_tta else [0]
+    # --- dataset cu weather (doar frame 0, vecinii se incarc separat pt TTA) ---
     dataset = WeatherKITTIDataset(
         opt.data_path, filenames, opt.height, opt.width,
-        frame_idxs, 4, is_train=False, img_ext='.png',
+        [0], 4, is_train=False, img_ext='.png',
         weather_fn=_weather_fn)
     dataloader = DataLoader(dataset, 1 if use_tta else 16,
                             shuffle=False, num_workers=2,
                             pin_memory=True, drop_last=False)
 
-    # --- TTA setup ---
+    # --- TTA setup (uncertainty minimization, nu necesita pose/vecini) ---
     if use_tta:
         depth_decoder.to(device).train()
-        pose_encoder = networks.ResnetEncoder(18, False, num_input_images=2)
-        pose_decoder = networks.PoseDecoder(
-            pose_encoder.num_ch_enc, num_input_features=1, num_frames_to_predict_for=2)
-        pose_encoder.load_state_dict(torch.load(
-            os.path.join(opt.load_weights_folder, "pose_encoder.pth"), map_location=device))
-        pose_decoder.load_state_dict(torch.load(
-            os.path.join(opt.load_weights_folder, "pose.pth"), map_location=device))
-        pose_encoder.to(device).eval()
-        pose_decoder.to(device).eval()
-        for p in pose_encoder.parameters(): p.requires_grad_(False)
-        for p in pose_decoder.parameters(): p.requires_grad_(False)
-
-        ssim_fn   = SSIM().to(device)
-        backproject = BackprojectDepth(1, opt.height, opt.width).to(device)
-        project     = Project3D(1, opt.height, opt.width).to(device)
-
-        # dataset fara weather pentru vecini (pose trebuie sa fie consistent)
-        dataset_clean_seq = datasets.KITTIRAWDataset(
-            opt.data_path, filenames, opt.height, opt.width,
-            [-1, 0, 1], 4, is_train=False, img_ext='.png')
     else:
         depth_decoder.to(device).eval()
 
@@ -288,29 +246,11 @@ def evaluate(opt):
     if use_tta:
         for idx, data in enumerate(dataloader):
             frame_target = data[("color_MiS", 0, 0)].to(device)
-            K     = data[("K_MiS", 0)].to(device).float()
-            inv_K = data[("inv_K_MiS", 0)].to(device).float()
 
-            has_neighbors = True
-            try:
-                seq = dataset_clean_seq[idx]
-                frame_prev = seq[("color_MiS", -1, 0)].unsqueeze(0).to(device)
-                frame_next = seq[("color_MiS",  1, 0)].unsqueeze(0).to(device)
-            except Exception:
-                has_neighbors = False
-
-            if has_neighbors:
-                disp_out = tta_step(
-                    encoder, depth_decoder, pose_encoder, pose_decoder,
-                    frame_target, frame_prev, frame_next,
-                    K, inv_K, ssim_fn, backproject, project,
-                    tta_lr=opt.tta_lr, n_steps=opt.tta_steps, device=device)
-            else:
-                depth_decoder.eval()
-                with torch.no_grad():
-                    out = depth_decoder(encoder(frame_target))
-                disp_out, _ = disp_to_depth(out[("disp", 0)][:, 0:1], 0.1, 100.0)
-                depth_decoder.train()
+            disp_out = tta_step(
+                encoder, depth_decoder, frame_target,
+                tta_lr=opt.tta_lr, n_steps=opt.tta_steps, device=device,
+                consistency_weight=getattr(opt, "tta_consistency_weight", 1.0))
 
             pred_disps.append(disp_out.cpu().numpy()[:, 0])
 
@@ -424,6 +364,7 @@ if __name__ == "__main__":
                                 help="intensitatea vremii")
     options.parser.add_argument("--use_tta", action="store_true",
                                 help="foloseste TTA la inferenta")
-    options.parser.add_argument("--tta_steps", type=int, default=3)
+    options.parser.add_argument("--tta_steps", type=int, default=5)
     options.parser.add_argument("--tta_lr",    type=float, default=1e-5)
+    options.parser.add_argument("--tta_consistency_weight", type=float, default=1.0)
     evaluate(options.parse())

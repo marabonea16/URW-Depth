@@ -70,7 +70,7 @@ def compute_photometric_loss(pred, target, ssim_fn):
 def tta_step(encoder, depth_decoder, pose_encoder, pose_decoder,
              frame_target, frame_prev, frame_next,
              K, inv_K, ssim_fn, backproject, project,
-             tta_lr, n_steps, device):
+             tta_lr, n_steps, device, consistency_weight=1.0):
     """
     Ruleaza N pasi TTA pe un singur sample.
     Actualizeaza doar depth_decoder (encoder si pose raman frozen).
@@ -80,7 +80,9 @@ def tta_step(encoder, depth_decoder, pose_encoder, pose_decoder,
     original_state = copy.deepcopy(depth_decoder.state_dict())
 
     # actualizeaza doar ultimul strat (dispconv) - cel mai stabil pentru TTA fara BN
-    dispconv_params = list(depth_decoder.convs[("dispconv", 0)].parameters())
+    # actualizeaza dispconv + uncertconv (capete de output)
+    dispconv_params = (list(depth_decoder.convs[("dispconv", 0)].parameters()) +
+                       list(depth_decoder.convs[("uncertconv", 0)].parameters()))
     optimizer = torch.optim.Adam(dispconv_params, lr=tta_lr)
 
     H, W = frame_target.shape[2], frame_target.shape[3]
@@ -141,7 +143,7 @@ def tta_step(encoder, depth_decoder, pose_encoder, pose_decoder,
 
         # consistency: nu lasa modelul sa se departeze prea mult de predictia initiala
         consistency_loss = F.l1_loss(disp, disp_init)
-        total_loss = total_loss + 10.0 * consistency_loss
+        total_loss = total_loss + consistency_weight * consistency_loss
 
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(dispconv_params, max_norm=1.0)
