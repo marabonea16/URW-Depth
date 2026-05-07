@@ -2,19 +2,21 @@
 Evaluare pe imagini cu vreme adversa simulata (fog, rain, snow).
 
 Aplica weather augmentation pe imaginile de test KITTI si evalueaza modelul.
-Suporta atat inferenta normala cat si TTA (Test-Time Adaptation).
+Suporta TTA fotometric cu vreme aplicata pe toate frame-urile (t-1, t, t+1):
+  - Semnalul TTA: consistenta fotometrica intre frame-urile cu vreme
+  - Variatia temporala (seeds diferite per frame) creeaza gradient real
 
 Folosire:
     # evaluare normala cu fog:
-    python evaluate_weather.py \
-        --load_weights_folder models/Tiny-Depth-Weather-Robust-Feature-Supression/models/weights_49 \
-        --eval_mono --height 192 --width 640 --scales 0 \
-        --data_path /home/ubuntu/TinyDepth --png \
-        --weather_type fog --weather_severity moderate \
-        --use_feature_suppression --use_wandb --wandb_project tinydepth
+    python evaluate_weather.py \\
+        --load_weights_folder models/Tiny-Depth-Weather-Robust-Feature-Supression/models/weights_49 \\
+        --eval_mono --height 192 --width 640 --scales 0 \\
+        --data_path /home/ubuntu/TinyDepth --png \\
+        --weather_type fog --weather_severity moderate \\
+        --use_feature_suppression
 
-    # cu TTA:
-    python evaluate_weather.py ... --use_tta --tta_steps 3 --tta_lr 1e-5
+    # cu TTA fotometric:
+    python evaluate_weather.py ... --use_tta --tta_steps 3 --tta_lr 1e-5 --tta_consistency_weight 0.5
 """
 
 from __future__ import absolute_import, division, print_function
@@ -23,7 +25,6 @@ import os
 import copy
 import cv2
 import numpy as np
-import random
 
 import torch
 import torch.nn.functional as F
@@ -31,7 +32,8 @@ from torch.utils.data import DataLoader
 from PIL import Image
 
 from networks.configuration import get_config
-from layer import disp_to_depth
+from layer import (disp_to_depth, BackprojectDepth, Project3D,
+                   SSIM, transformation_from_parameters)
 from utils import readlines
 from options import MonodepthOptions
 import datasets
@@ -54,19 +56,27 @@ SEVERITY_MAP = {
     "severe":   0.65,
 }
 
-def apply_fog(img, severity=0.45):
+
+def apply_fog(img, severity=0.45, frame_seed=None):
+    """Fog augmentation. frame_seed adds ±5% temporal variation for TTA signal."""
     arr = np.array(img, dtype=np.float32)
     fog_color = np.array([220, 220, 220], dtype=np.float32)
     h = arr.shape[0]
+    if frame_seed is not None:
+        rng = np.random.RandomState(int(abs(1000 + frame_seed)) % (2**31))
+        severity = float(severity) * float(np.clip(1.0 + 0.05 * rng.randn(), 0.85, 1.15))
     gradient = np.linspace(severity, severity * 0.3, h, dtype=np.float32)[:, None, None]
     arr = arr * (1 - gradient) + fog_color * gradient
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
 
-def apply_rain(img, severity=0.45):
+
+def apply_rain(img, severity=0.45, frame_seed=None):
+    """Rain augmentation. frame_seed changes streak positions between frames."""
     arr = np.array(img, dtype=np.float32)
     h, w = arr.shape[:2]
     num_streaks = int(severity * 600)
-    rng = np.random.RandomState(42)
+    seed = 42 if frame_seed is None else (int(frame_seed) % (2**31))
+    rng = np.random.RandomState(seed)
     for _ in range(num_streaks):
         x = rng.randint(0, w)
         y = rng.randint(0, h - 20)
@@ -79,12 +89,15 @@ def apply_rain(img, severity=0.45):
     arr = arr * (1 - severity * 0.15) + 128 * severity * 0.15
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
 
-def apply_snow(img, severity=0.45):
+
+def apply_snow(img, severity=0.45, frame_seed=None):
+    """Snow augmentation. frame_seed changes flake positions between frames."""
     arr = np.array(img, dtype=np.float32)
     h, w = arr.shape[:2]
     gray = arr.mean(axis=2, keepdims=True)
     arr = arr * (1 - severity * 0.4) + gray * severity * 0.4
-    rng = np.random.RandomState(42)
+    seed = 42 if frame_seed is None else (int(frame_seed) % (2**31))
+    rng = np.random.RandomState(seed)
     num_flakes = int(severity * 800)
     ys = rng.randint(0, h, num_flakes)
     xs = rng.randint(0, w, num_flakes)
@@ -93,9 +106,11 @@ def apply_snow(img, severity=0.45):
         arr[y, x] = arr[y, x] * (1 - a) + 255 * a
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
 
+
 WEATHER_FNS = {"fog": apply_fog, "rain": apply_rain, "snow": apply_snow}
 
 # ── metrics ────────────────────────────────────────────────────────────────────
+
 
 def compute_errors(gt, pred):
     thresh = np.maximum((gt / pred), (pred / gt))
@@ -108,43 +123,76 @@ def compute_errors(gt, pred):
     sq_rel   = np.mean(((gt - pred) ** 2) / gt)
     return abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
 
-# ── TTA step ───────────────────────────────────────────────────────────────────
 
-def tta_step(encoder, depth_decoder,
-             frame_target,
+def compute_photometric_loss(pred, target, ssim_fn):
+    abs_diff = torch.abs(target - pred)
+    l1 = abs_diff.mean(1, True)
+    ssim_loss = ssim_fn(pred, target).mean(1, True)
+    return 0.85 * ssim_loss + 0.15 * l1
+
+# ── TTA step (photometric, weather-consistent frames) ─────────────────────────
+
+
+def tta_step(encoder, depth_decoder, pose_encoder, pose_decoder,
+             frame_target, frame_prev, frame_next,
+             K, inv_K, ssim_fn, backproject, project,
              tta_lr, n_steps, device, consistency_weight=1.0):
     """
-    Uncertainty Minimization TTA:
-    Minimizeaza media sigma (incertitudinea) + consistency fata de predictia initiala.
-    Nu necesita frame-uri vecine sau retea de pose.
-    Pixelii cu sigma mare = afectati de weather -> forteaza predictii mai sigure.
+    Photometric TTA cu vreme consistenta pe toate frame-urile.
+
+    Semnalul: consistenta fotometrica intre frame_t (weather) si
+    frame_t-1 / frame_t+1 (acelasi tip de vreme, seed diferit).
+
+    Variatia temporala (±5% intensitate sau streaks diferite) creeaza
+    un gradient real care ghideaza adaptarea la vreme adversa.
     """
     original_state = copy.deepcopy(depth_decoder.state_dict())
-    # actualizeaza ambele capete de output
     tta_params = (list(depth_decoder.convs[("dispconv", 0)].parameters()) +
                   list(depth_decoder.convs[("uncertconv", 0)].parameters()))
     optimizer = torch.optim.Adam(tta_params, lr=tta_lr)
 
+    dxy = torch.zeros(1, 2, device=device)
+
     with torch.no_grad():
         feats_init = encoder(frame_target)
-        output_init = depth_decoder(feats_init)
-        disp_init = output_init[("disp", 0)][:, 0:1].detach()
+        out_init = depth_decoder(feats_init)
+        disp_init = out_init[("disp", 0)][:, 0:1].detach()
 
     for _ in range(n_steps):
         optimizer.zero_grad()
         with torch.no_grad():
             feats = encoder(frame_target)
         output = depth_decoder(feats)
+        disp = output[("disp", 0)][:, 0:1]
+        _, depth = disp_to_depth(disp, 0.1, 100.0)
 
-        disp  = output[("disp", 0)][:, 0:1]
-        sigma = torch.sigmoid(output[("uncert", 0)])
+        # Pose prediction (frozen)
+        with torch.no_grad():
+            pose_in_prev = torch.cat([frame_prev, frame_target], dim=1)
+            axisangle_prev, trans_prev = pose_decoder([pose_encoder(pose_in_prev)])
+            T_prev = transformation_from_parameters(
+                axisangle_prev[:, 0], trans_prev[:, 0], invert=True)
 
-        # uncertainty minimization: forteaza predictii sigure pe regiunile cu weather
-        uncert_loss = sigma.mean()
-        # consistency: disp nu deriva prea mult de la predictia initiala
+            pose_in_next = torch.cat([frame_target, frame_next], dim=1)
+            axisangle_next, trans_next = pose_decoder([pose_encoder(pose_in_next)])
+            T_next = transformation_from_parameters(
+                axisangle_next[:, 0], trans_next[:, 0], invert=False)
+
+        # Photometric loss on weather-consistent frames
+        total_photo = torch.tensor(0.0, device=device)
+        for T, src in [(T_prev, frame_prev), (T_next, frame_next)]:
+            cam_pts = backproject(depth, inv_K, dxy)
+            pix_coords = project(cam_pts, K, T, dxy)
+            reconstructed = F.grid_sample(
+                src, pix_coords,
+                mode="bilinear", padding_mode="border", align_corners=False)
+            photo_loss = compute_photometric_loss(reconstructed, frame_target, ssim_fn)
+            total_photo = total_photo + photo_loss.mean()
+
+        # Consistency: prevent depth from drifting too far from initial prediction
         consist_loss = F.l1_loss(disp, disp_init)
+        total_loss = total_photo + consistency_weight * consist_loss
 
-        total_loss = uncert_loss + consistency_weight * consist_loss
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(tta_params, max_norm=1.0)
         optimizer.step()
@@ -160,19 +208,37 @@ def tta_step(encoder, depth_decoder,
 
 # ── dataset cu weather aplicat pe imagini ─────────────────────────────────────
 
+
 class WeatherKITTIDataset(datasets.KITTIRAWDataset):
-    """Wrapper care aplica weather augmentation pe imaginile incarcate."""
-    def __init__(self, *args, weather_fn=None, **kwargs):
+    """
+    Wrapper care aplica weather augmentation pe imaginile incarcate.
+    Daca use_temporal_var=True, frame_index e folosit ca seed pentru
+    variatie temporala (rain/snow: streaks diferite; fog: intensitate ±5%).
+    """
+    def __init__(self, *args, weather_fn=None, use_temporal_var=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.weather_fn = weather_fn
+        self.use_temporal_var = use_temporal_var
 
     def get_color(self, folder, frame_index, side, do_flip):
-        img = super().get_color(folder, frame_index, side, do_flip)
+        try:
+            img = super().get_color(folder, frame_index, side, do_flip)
+        except FileNotFoundError:
+            # Boundary frame: clamp to nearest valid index
+            fallback = max(frame_index, 0)
+            try:
+                img = super().get_color(folder, fallback, side, do_flip)
+            except FileNotFoundError:
+                img = super().get_color(folder, 1, side, do_flip)
         if self.weather_fn is not None:
-            img = self.weather_fn(img)
+            if self.use_temporal_var:
+                img = self.weather_fn(img, frame_seed=frame_index)
+            else:
+                img = self.weather_fn(img)
         return img
 
 # ── main evaluate ──────────────────────────────────────────────────────────────
+
 
 def evaluate(opt):
     MIN_DEPTH, MAX_DEPTH = 1e-3, 80
@@ -189,8 +255,9 @@ def evaluate(opt):
     if weather_fn is None:
         raise ValueError(f"weather_type necunoscut: {weather_type}. Alege: fog, rain, snow")
 
-    # fix severity
     _weather_fn = lambda img: weather_fn(img, severity=severity)
+    _weather_fn_temporal = lambda img, frame_seed: weather_fn(img, severity=severity,
+                                                              frame_seed=frame_seed)
 
     opt.load_weights_folder = os.path.expanduser(opt.load_weights_folder)
     print("-> Loading weights from {}".format(opt.load_weights_folder))
@@ -215,24 +282,52 @@ def evaluate(opt):
         strict=False)
 
     encoder.to(device).eval()
-    for p in encoder.parameters(): p.requires_grad_(False)
+    for p in encoder.parameters():
+        p.requires_grad_(False)
 
-    # --- dataset cu weather (doar frame 0, vecinii se incarc separat pt TTA) ---
-    dataset = WeatherKITTIDataset(
-        opt.data_path, filenames, opt.height, opt.width,
-        [0], 4, is_train=False, img_ext='.png',
-        weather_fn=_weather_fn)
-    dataloader = DataLoader(dataset, 1 if use_tta else 16,
-                            shuffle=False, num_workers=2,
-                            pin_memory=True, drop_last=False)
-
-    # --- TTA setup (uncertainty minimization, nu necesita pose/vecini) ---
     if use_tta:
         depth_decoder.to(device).train()
+        # Load pose network for photometric TTA
+        pose_encoder = networks.ResnetEncoder(18, False, num_input_images=2)
+        pose_decoder = networks.PoseDecoder(pose_encoder.num_ch_enc,
+                                            num_input_features=1,
+                                            num_frames_to_predict_for=2)
+        pose_encoder.load_state_dict(
+            torch.load(os.path.join(opt.load_weights_folder, "pose_encoder.pth"),
+                       map_location=device))
+        pose_decoder.load_state_dict(
+            torch.load(os.path.join(opt.load_weights_folder, "pose.pth"),
+                       map_location=device))
+        pose_encoder.to(device).eval()
+        pose_decoder.to(device).eval()
+        for p in pose_encoder.parameters():
+            p.requires_grad_(False)
+        for p in pose_decoder.parameters():
+            p.requires_grad_(False)
+
+        # Geometry layers
+        ssim_fn = SSIM().to(device)
+        backproject = BackprojectDepth(1, opt.height, opt.width).to(device)
+        project = Project3D(1, opt.height, opt.width).to(device)
+
+        # Dataset with temporal variation for TTA (all 3 frames with weather)
+        dataset_tta = WeatherKITTIDataset(
+            opt.data_path, filenames, opt.height, opt.width,
+            [-1, 0, 1], 4, is_train=False, img_ext='.png',
+            weather_fn=_weather_fn_temporal, use_temporal_var=True)
+
+        dataloader = DataLoader(dataset_tta, 1, shuffle=False,
+                                num_workers=2, pin_memory=True, drop_last=False)
     else:
         depth_decoder.to(device).eval()
+        dataset = WeatherKITTIDataset(
+            opt.data_path, filenames, opt.height, opt.width,
+            [0], 4, is_train=False, img_ext='.png',
+            weather_fn=_weather_fn)
+        dataloader = DataLoader(dataset, 16, shuffle=False,
+                                num_workers=2, pin_memory=True, drop_last=False)
 
-    # --- GT depth ---
+    # GT depth
     gt_path   = os.path.join(splits_dir, opt.eval_split, "gt_depths.npz")
     gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1',
                         allow_pickle=True)["data"]
@@ -245,12 +340,30 @@ def evaluate(opt):
 
     if use_tta:
         for idx, data in enumerate(dataloader):
-            frame_target = data[("color_MiS", 0, 0)].to(device)
+            frame_target = data[("color_MiS",  0, 0)].to(device)
+            K     = data[("K_MiS", 0)].to(device).float()
+            inv_K = data[("inv_K_MiS", 0)].to(device).float()
 
-            disp_out = tta_step(
-                encoder, depth_decoder, frame_target,
-                tta_lr=opt.tta_lr, n_steps=opt.tta_steps, device=device,
-                consistency_weight=getattr(opt, "tta_consistency_weight", 1.0))
+            has_neighbors = True
+            try:
+                frame_prev = data[("color_MiS", -1, 0)].to(device)
+                frame_next = data[("color_MiS",  1, 0)].to(device)
+            except (KeyError, Exception):
+                has_neighbors = False
+
+            if has_neighbors:
+                disp_out = tta_step(
+                    encoder, depth_decoder, pose_encoder, pose_decoder,
+                    frame_target, frame_prev, frame_next,
+                    K, inv_K, ssim_fn, backproject, project,
+                    tta_lr=opt.tta_lr, n_steps=opt.tta_steps, device=device,
+                    consistency_weight=getattr(opt, "tta_consistency_weight", 1.0))
+            else:
+                depth_decoder.eval()
+                with torch.no_grad():
+                    out = depth_decoder(encoder(frame_target))
+                disp_out, _ = disp_to_depth(out[("disp", 0)][:, 0:1], 0.1, 100.0)
+                depth_decoder.train()
 
             pred_disps.append(disp_out.cpu().numpy()[:, 0])
 
@@ -266,6 +379,7 @@ def evaluate(opt):
             if (idx + 1) % 50 == 0:
                 print("  [{}/{}]".format(idx + 1, len(filenames)))
     else:
+        flip_ensemble = getattr(opt, "flip_ensemble", False)
         with torch.no_grad():
             for data in dataloader:
                 input_color = data[("color_MiS", 0, 0)].to(device)
@@ -273,6 +387,15 @@ def evaluate(opt):
                 pred_disp, _ = disp_to_depth(
                     output[("disp", 0)][:, 0, :, :].unsqueeze(1),
                     opt.min_depth, opt.max_depth)
+
+                if flip_ensemble:
+                    input_flip = torch.flip(input_color, [3])
+                    output_flip = depth_decoder(encoder(input_flip))
+                    pred_disp_flip, _ = disp_to_depth(
+                        output_flip[("disp", 0)][:, 0, :, :].unsqueeze(1),
+                        opt.min_depth, opt.max_depth)
+                    pred_disp = 0.5 * (pred_disp + torch.flip(pred_disp_flip, [3]))
+
                 pred_disps.append(pred_disp.cpu()[:, 0].numpy())
 
                 if len(sample_uncert_maps) < 8 and ("uncert", 0) in output:
@@ -284,7 +407,7 @@ def evaluate(opt):
 
     pred_disps = np.concatenate(pred_disps)
 
-    # --- metrici ---
+    # Metrics
     errors, ratios = [], []
     for i in range(pred_disps.shape[0]):
         gt_depth = gt_depths[i]
@@ -309,7 +432,7 @@ def evaluate(opt):
     print("\n   abs_rel |   sq_rel |     rmse | rmse_log |       a1 |       a2 |       a3 |")
     print(("&   {:.3f}  " * 7).format(*mean_errors))
 
-    # --- wandb ---
+    # wandb logging
     if getattr(opt, "use_wandb", False) and wandb is not None:
         mode = "tta" if use_tta else "no_tta"
         run_name = (getattr(opt, "wandb_run_name", None) or
@@ -363,8 +486,13 @@ if __name__ == "__main__":
                                 choices=["mild", "moderate", "severe"],
                                 help="intensitatea vremii")
     options.parser.add_argument("--use_tta", action="store_true",
-                                help="foloseste TTA la inferenta")
-    options.parser.add_argument("--tta_steps", type=int, default=5)
-    options.parser.add_argument("--tta_lr",    type=float, default=1e-5)
-    options.parser.add_argument("--tta_consistency_weight", type=float, default=1.0)
+                                help="foloseste TTA fotometric cu vreme consistenta")
+    options.parser.add_argument("--tta_steps", type=int, default=3,
+                                help="pasi gradient TTA per imagine")
+    options.parser.add_argument("--tta_lr", type=float, default=1e-5,
+                                help="learning rate TTA")
+    options.parser.add_argument("--tta_consistency_weight", type=float, default=1.0,
+                                help="weight pentru consistency loss in TTA")
+    options.parser.add_argument("--flip_ensemble", action="store_true",
+                                help="TTA simplu: medie cu predictia imaginii orizontal-flipped")
     evaluate(options.parse())
