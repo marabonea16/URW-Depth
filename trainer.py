@@ -702,47 +702,82 @@ class Trainer:
             mask4consis[idxs_MiS == 1] = 0
             mask4consis = mask4consis.unsqueeze(1).detach() #[12,1,192,640]
 
-            # uncertainty-weighted photometric loss:
-            # loss = (1 - sigma.detach()) * photometric * uncert_mask + lambda * sigma
-            # sigma = sigmoid(uncert) in [0,1]: mare = nesigur, mic = sigur
-            # sigma.detach() separa invatarea uncertainty de depth
-            # uncert_mask: ignora pixelii cu sigma > 0.8 (uncertainty-guided automasking)
-            sigma_HiS = torch.sigmoid(F.interpolate(
-                outputs["out_HiS"][("uncert", 0)], [self.opt.height, self.opt.width],
-                mode="bilinear", align_corners=False))
-            uncert_mask_HiS = (sigma_HiS < 0.8).float()
-            loss_HiS += ((1.0 - sigma_HiS.detach()) * to_optimise_HiS.unsqueeze(1) * uncert_mask_HiS + self.opt.uncert_weight * sigma_HiS).mean()
-            mean_disp_HiS = disp_HiS.mean(2, True).mean(3, True)
-            norm_disp_HiS = disp_HiS / (mean_disp_HiS + 1e-7)
-            smooth_loss_HiS = get_smooth_loss(norm_disp_HiS, color_HiS)
-            loss_HiS += self.opt.disparity_smoothness * smooth_loss_HiS
-            loss_HiS += self.opt.uncert_smoothness * get_smooth_loss(sigma_HiS, color_HiS)
+            use_nll = getattr(self.opt, 'laplacian_nll', False)
+            if use_nll:
+                # Laplacian NLL: loss = log_s + photo / exp(log_s)
+                # equilibrium: exp(log_s*) = photo_loss -> sigma calibrated to photometric error
+                log_s_HiS = F.interpolate(
+                    outputs["out_HiS"][("uncert", 0)], [self.opt.height, self.opt.width],
+                    mode="bilinear", align_corners=False)
+                s_HiS = torch.exp(log_s_HiS.clamp(-6, 6))
+                loss_HiS += (log_s_HiS + to_optimise_HiS.unsqueeze(1) / s_HiS).mean()
+                mean_disp_HiS = disp_HiS.mean(2, True).mean(3, True)
+                norm_disp_HiS = disp_HiS / (mean_disp_HiS + 1e-7)
+                loss_HiS += self.opt.disparity_smoothness * get_smooth_loss(norm_disp_HiS, color_HiS)
+                loss_HiS += self.opt.uncert_smoothness * get_smooth_loss(log_s_HiS, color_HiS)
 
-            sigma_MiS = torch.sigmoid(F.interpolate(
-                outputs["out_MiS"][("uncert", 0)], [self.opt.height, self.opt.width],
-                mode="bilinear", align_corners=False))
-            uncert_mask_MiS = (sigma_MiS < 0.8).float()
-            loss_MiS += ((1.0 - sigma_MiS.detach()) * to_optimise_MiS.unsqueeze(1) * uncert_mask_MiS + self.opt.uncert_weight * sigma_MiS).mean()
-            mean_disp_MiS = disp_MiS.mean(2, True).mean(3, True)
-            norm_disp_MiS = disp_MiS / (mean_disp_MiS + 1e-7)
-            smooth_loss_MiS = get_smooth_loss(norm_disp_MiS, color_MiS)
-            loss_MiS += self.opt.disparity_smoothness * smooth_loss_MiS
-            loss_MiS += self.opt.uncert_smoothness * get_smooth_loss(sigma_MiS, color_MiS)
+                log_s_MiS = F.interpolate(
+                    outputs["out_MiS"][("uncert", 0)], [self.opt.height, self.opt.width],
+                    mode="bilinear", align_corners=False)
+                s_MiS = torch.exp(log_s_MiS.clamp(-6, 6))
+                loss_MiS += (log_s_MiS + to_optimise_MiS.unsqueeze(1) / s_MiS).mean()
+                mean_disp_MiS = disp_MiS.mean(2, True).mean(3, True)
+                norm_disp_MiS = disp_MiS / (mean_disp_MiS + 1e-7)
+                loss_MiS += self.opt.disparity_smoothness * get_smooth_loss(norm_disp_MiS, color_MiS)
+                loss_MiS += self.opt.uncert_smoothness * get_smooth_loss(log_s_MiS, color_MiS)
 
-            sigma_LoS = torch.sigmoid(F.interpolate(
-                outputs["out_LoS"][("uncert", 0)], [self.opt.height, self.opt.width],
-                mode="bilinear", align_corners=False))
-            uncert_mask_LoS = (sigma_LoS < 0.8).float()
-            loss_LoS += ((1.0 - sigma_LoS.detach()) * to_optimise_LoS.unsqueeze(1) * uncert_mask_LoS + self.opt.uncert_weight * sigma_LoS).mean()
-            mean_disp_LoS = disp_LoS.mean(2, True).mean(3, True)
-            norm_disp_LoS = disp_LoS / (mean_disp_LoS + 1e-7)
-            smooth_loss_LoS = get_smooth_loss(norm_disp_LoS, color_LoS)
-            loss_LoS += self.opt.disparity_smoothness * smooth_loss_LoS
-            loss_LoS += self.opt.uncert_smoothness * get_smooth_loss(sigma_LoS, color_LoS)
+                log_s_LoS = F.interpolate(
+                    outputs["out_LoS"][("uncert", 0)], [self.opt.height, self.opt.width],
+                    mode="bilinear", align_corners=False)
+                s_LoS = torch.exp(log_s_LoS.clamp(-6, 6))
+                loss_LoS += (log_s_LoS + to_optimise_LoS.unsqueeze(1) / s_LoS).mean()
+                mean_disp_LoS = disp_LoS.mean(2, True).mean(3, True)
+                norm_disp_LoS = disp_LoS / (mean_disp_LoS + 1e-7)
+                loss_LoS += self.opt.disparity_smoothness * get_smooth_loss(norm_disp_LoS, color_LoS)
+                loss_LoS += self.opt.uncert_smoothness * get_smooth_loss(log_s_LoS, color_LoS)
 
-            # consistenta cross-modal: sigma HiS si MiS ar trebui sa fie similare
-            loss_HiS += self.opt.uncert_smoothness * torch.mean(
-                torch.abs(sigma_HiS - sigma_MiS.detach()))
+                # cross-modal consistency on log-scale uncertainty
+                loss_HiS += self.opt.uncert_smoothness * torch.mean(
+                    torch.abs(log_s_HiS - log_s_MiS.detach()))
+            else:
+                # uncertainty-weighted photometric loss (original):
+                # loss = (1 - sigma.detach()) * photometric * uncert_mask + lambda * sigma
+                sigma_HiS = torch.sigmoid(F.interpolate(
+                    outputs["out_HiS"][("uncert", 0)], [self.opt.height, self.opt.width],
+                    mode="bilinear", align_corners=False))
+                uncert_mask_HiS = (sigma_HiS < 0.8).float()
+                loss_HiS += ((1.0 - sigma_HiS.detach()) * to_optimise_HiS.unsqueeze(1) * uncert_mask_HiS + self.opt.uncert_weight * sigma_HiS).mean()
+                mean_disp_HiS = disp_HiS.mean(2, True).mean(3, True)
+                norm_disp_HiS = disp_HiS / (mean_disp_HiS + 1e-7)
+                smooth_loss_HiS = get_smooth_loss(norm_disp_HiS, color_HiS)
+                loss_HiS += self.opt.disparity_smoothness * smooth_loss_HiS
+                loss_HiS += self.opt.uncert_smoothness * get_smooth_loss(sigma_HiS, color_HiS)
+
+                sigma_MiS = torch.sigmoid(F.interpolate(
+                    outputs["out_MiS"][("uncert", 0)], [self.opt.height, self.opt.width],
+                    mode="bilinear", align_corners=False))
+                uncert_mask_MiS = (sigma_MiS < 0.8).float()
+                loss_MiS += ((1.0 - sigma_MiS.detach()) * to_optimise_MiS.unsqueeze(1) * uncert_mask_MiS + self.opt.uncert_weight * sigma_MiS).mean()
+                mean_disp_MiS = disp_MiS.mean(2, True).mean(3, True)
+                norm_disp_MiS = disp_MiS / (mean_disp_MiS + 1e-7)
+                smooth_loss_MiS = get_smooth_loss(norm_disp_MiS, color_MiS)
+                loss_MiS += self.opt.disparity_smoothness * smooth_loss_MiS
+                loss_MiS += self.opt.uncert_smoothness * get_smooth_loss(sigma_MiS, color_MiS)
+
+                sigma_LoS = torch.sigmoid(F.interpolate(
+                    outputs["out_LoS"][("uncert", 0)], [self.opt.height, self.opt.width],
+                    mode="bilinear", align_corners=False))
+                uncert_mask_LoS = (sigma_LoS < 0.8).float()
+                loss_LoS += ((1.0 - sigma_LoS.detach()) * to_optimise_LoS.unsqueeze(1) * uncert_mask_LoS + self.opt.uncert_weight * sigma_LoS).mean()
+                mean_disp_LoS = disp_LoS.mean(2, True).mean(3, True)
+                norm_disp_LoS = disp_LoS / (mean_disp_LoS + 1e-7)
+                smooth_loss_LoS = get_smooth_loss(norm_disp_LoS, color_LoS)
+                loss_LoS += self.opt.disparity_smoothness * smooth_loss_LoS
+                loss_LoS += self.opt.uncert_smoothness * get_smooth_loss(sigma_LoS, color_LoS)
+
+                # consistenta cross-modal: sigma HiS si MiS ar trebui sa fie similare
+                loss_HiS += self.opt.uncert_smoothness * torch.mean(
+                    torch.abs(sigma_HiS - sigma_MiS.detach()))
 
 
             # Lcs0
@@ -797,9 +832,14 @@ class Trainer:
         losses["loss_consis_HiS"] = loss_consis_HiS
         losses["loss_consis_LoS"] = loss_consis_LoS
         with torch.no_grad():
-            losses["uncert_HiS_mean"] = torch.sigmoid(outputs["out_HiS"][("uncert", 0)]).mean()
-            losses["uncert_MiS_mean"] = torch.sigmoid(outputs["out_MiS"][("uncert", 0)]).mean()
-            losses["uncert_LoS_mean"] = torch.sigmoid(outputs["out_LoS"][("uncert", 0)]).mean()
+            if getattr(self.opt, 'laplacian_nll', False):
+                losses["uncert_HiS_mean"] = torch.exp(outputs["out_HiS"][("uncert", 0)].clamp(-6, 6)).mean()
+                losses["uncert_MiS_mean"] = torch.exp(outputs["out_MiS"][("uncert", 0)].clamp(-6, 6)).mean()
+                losses["uncert_LoS_mean"] = torch.exp(outputs["out_LoS"][("uncert", 0)].clamp(-6, 6)).mean()
+            else:
+                losses["uncert_HiS_mean"] = torch.sigmoid(outputs["out_HiS"][("uncert", 0)]).mean()
+                losses["uncert_MiS_mean"] = torch.sigmoid(outputs["out_MiS"][("uncert", 0)]).mean()
+                losses["uncert_LoS_mean"] = torch.sigmoid(outputs["out_LoS"][("uncert", 0)]).mean()
 
         # print("loss_HiS:",loss_HiS.cpu().data, "loss_MiS:",loss_MiS.cpu().data, "loss_LoS:",loss_LoS.cpu().data, "loss_consis_HiS:",loss_consis_HiS.cpu().data, "loss_consis_LoS:",loss_consis_LoS.cpu().data, "loss:",total_loss.cpu().data)
         return losses

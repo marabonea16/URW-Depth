@@ -220,6 +220,9 @@ class MonodepthOptions:
                                  type=float,
                                  help="weight for edge-aware uncertainty smoothness loss",
                                  default=1e-3)
+        self.parser.add_argument("--laplacian_nll",
+                                 help="use Laplacian NLL loss for calibrated uncertainty (fixes sigma collapse)",
+                                 action="store_true")
         self.parser.add_argument("--use_wandb",
                                  help="if set, log training metrics to Weights & Biases",
                                  action="store_true")
