@@ -708,8 +708,8 @@ class Trainer:
                 # equilibrium: exp(log_s*) = photo_loss -> sigma calibrated to photometric error
                 log_s_HiS = F.interpolate(
                     outputs["out_HiS"][("uncert", 0)], [self.opt.height, self.opt.width],
-                    mode="bilinear", align_corners=False)
-                s_HiS = torch.exp(log_s_HiS.clamp(-6, 6))
+                    mode="bilinear", align_corners=False).clamp(-6, 6)
+                s_HiS = torch.exp(log_s_HiS)
                 loss_HiS += (log_s_HiS + to_optimise_HiS.unsqueeze(1) / s_HiS).mean()
                 mean_disp_HiS = disp_HiS.mean(2, True).mean(3, True)
                 norm_disp_HiS = disp_HiS / (mean_disp_HiS + 1e-7)
@@ -718,8 +718,8 @@ class Trainer:
 
                 log_s_MiS = F.interpolate(
                     outputs["out_MiS"][("uncert", 0)], [self.opt.height, self.opt.width],
-                    mode="bilinear", align_corners=False)
-                s_MiS = torch.exp(log_s_MiS.clamp(-6, 6))
+                    mode="bilinear", align_corners=False).clamp(-6, 6)
+                s_MiS = torch.exp(log_s_MiS)
                 loss_MiS += (log_s_MiS + to_optimise_MiS.unsqueeze(1) / s_MiS).mean()
                 mean_disp_MiS = disp_MiS.mean(2, True).mean(3, True)
                 norm_disp_MiS = disp_MiS / (mean_disp_MiS + 1e-7)
@@ -728,8 +728,8 @@ class Trainer:
 
                 log_s_LoS = F.interpolate(
                     outputs["out_LoS"][("uncert", 0)], [self.opt.height, self.opt.width],
-                    mode="bilinear", align_corners=False)
-                s_LoS = torch.exp(log_s_LoS.clamp(-6, 6))
+                    mode="bilinear", align_corners=False).clamp(-6, 6)
+                s_LoS = torch.exp(log_s_LoS)
                 loss_LoS += (log_s_LoS + to_optimise_LoS.unsqueeze(1) / s_LoS).mean()
                 mean_disp_LoS = disp_LoS.mean(2, True).mean(3, True)
                 norm_disp_LoS = disp_LoS / (mean_disp_LoS + 1e-7)
