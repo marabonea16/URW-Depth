@@ -242,7 +242,7 @@ class WeatherKITTIDataset(datasets.KITTIRAWDataset):
 
 def evaluate(opt):
     MIN_DEPTH, MAX_DEPTH = 1e-3, 80
-    device = torch.device("cuda")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     assert opt.eval_mono, "Necesita --eval_mono"
 

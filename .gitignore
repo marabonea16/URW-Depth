@@ -179,3 +179,10 @@ wandb/
 # Misc
 .codex
 splits/eigen/gt_depths.npz
+
+# Large data files
+kitti_c.zip
+drivingstereo_weather/
+
+# Claude Code session files
+.claude/

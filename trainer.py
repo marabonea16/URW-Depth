@@ -75,7 +75,7 @@ class Trainer:
 
 
 
-        self.models["encoder"] = networks.build_model(self.config)
+        self.models["encoder"] = networks.build_model(self.config, img_width=self.opt.width, img_height=self.opt.height, use_checkpoint=self.use_activation_checkpoint)
         self.models["encoder"].to(self.device)
         self.parameters_to_train += list(self.models["encoder"].parameters())
 
@@ -163,7 +163,8 @@ class Trainer:
         train_dataset = self.dataset(
             self.opt.data_path, train_filenames, self.opt.height, self.opt.width,
             self.opt.frame_ids, 4, is_train=True, img_ext=img_ext,
-            use_weather_aug=getattr(self.opt, "use_weather_aug", False))
+            use_weather_aug=getattr(self.opt, "use_weather_aug", False),
+            use_corruption_aug=getattr(self.opt, "use_corruption_aug", False))
         self.train_loader = DataLoader(
             train_dataset, self.opt.batch_size, True,
             num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)

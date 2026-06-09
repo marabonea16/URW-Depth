@@ -79,6 +79,50 @@ def apply_snow(img, severity=None):
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
 
 
+def apply_defocus_blur(img):
+    """Blur de defocus: gaussian cu kernel mare."""
+    import cv2
+    severity = random.uniform(0.5, 2.5)
+    ksize = int(severity * 4) * 2 + 1  # odd kernel
+    arr = np.array(img, dtype=np.uint8)
+    arr = cv2.GaussianBlur(arr, (ksize, ksize), severity)
+    return Image.fromarray(arr)
+
+
+def apply_motion_blur(img):
+    """Motion blur liniar in directie aleatoare."""
+    import cv2
+    length = random.randint(5, 20)
+    angle = random.uniform(0, 360)
+    arr = np.array(img, dtype=np.uint8)
+    # kernel liniar rotit
+    kernel = np.zeros((length, length), dtype=np.float32)
+    kernel[length // 2, :] = 1.0 / length
+    rad = np.deg2rad(angle)
+    M = cv2.getRotationMatrix2D((length / 2, length / 2), angle, 1)
+    kernel = cv2.warpAffine(kernel, M, (length, length))
+    kernel = kernel / (kernel.sum() + 1e-8)
+    arr = cv2.filter2D(arr, -1, kernel)
+    return Image.fromarray(arr)
+
+
+def apply_gaussian_noise(img):
+    """Zgomot gaussian aditiv."""
+    sigma = random.uniform(5, 30)
+    arr = np.array(img, dtype=np.float32)
+    noise = np.random.normal(0, sigma, arr.shape).astype(np.float32)
+    arr = arr + noise
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+
+def apply_shot_noise(img):
+    """Shot noise (Poisson)."""
+    scale = random.uniform(0.02, 0.15)
+    arr = np.array(img, dtype=np.float32) / 255.0
+    arr = np.random.poisson(arr / scale) * scale
+    return Image.fromarray(np.clip(arr * 255, 0, 255).astype(np.uint8))
+
+
 def apply_weather_aug(img):
     """Aplica random unul dintre: fog, rain, snow (cu prob 50% per sample)."""
     if random.random() > 0.5:
@@ -90,6 +134,27 @@ def apply_weather_aug(img):
         return apply_rain(img)
     else:
         return apply_snow(img)
+
+
+def apply_corruption_aug(img):
+    """Weather + blur + noise aug pentru robustete completa pe KITTI-C."""
+    if random.random() > 0.5:
+        return img  # 50% imagini curate
+    choice = random.randint(0, 6)
+    if choice == 0:
+        return apply_fog(img)
+    elif choice == 1:
+        return apply_rain(img)
+    elif choice == 2:
+        return apply_snow(img)
+    elif choice == 3:
+        return apply_defocus_blur(img)
+    elif choice == 4:
+        return apply_motion_blur(img)
+    elif choice == 5:
+        return apply_gaussian_noise(img)
+    else:
+        return apply_shot_noise(img)
 
 
 class MonoDataset(data.Dataset):
@@ -114,7 +179,8 @@ class MonoDataset(data.Dataset):
                  num_scales,
                  is_train=False,
                  img_ext='.png',
-                 use_weather_aug=False):
+                 use_weather_aug=False,
+                 use_corruption_aug=False):
         super(MonoDataset, self).__init__()
 
         self.data_path = data_path
@@ -132,6 +198,7 @@ class MonoDataset(data.Dataset):
         self.is_train = is_train
         self.img_ext = img_ext
         self.use_weather_aug = use_weather_aug
+        self.use_corruption_aug = use_corruption_aug
 
         self.loader = pil_loader
         self.to_tensor = transforms.ToTensor()
@@ -294,18 +361,18 @@ class MonoDataset(data.Dataset):
         else:
             side = None
 
-        # weather augmentation: aplica acelasi tip de vreme la toate frame-urile din secventa
-        # (consistent temporal) — 50% din samplete raman curate
-        do_weather_aug = self.is_train and self.use_weather_aug and random.random() > 0.5
-        weather_fn = None
-        if do_weather_aug:
+        # augmentare: acelasi tip aplicat consistent la toate frame-urile din secventa
+        aug_fn = None
+        if self.is_train and self.use_corruption_aug:
+            if random.random() > 0.5:
+                choice = random.randint(0, 6)
+                aug_fn = [apply_fog, apply_rain, apply_snow,
+                          apply_defocus_blur, apply_motion_blur,
+                          apply_gaussian_noise, apply_shot_noise][choice]
+        elif self.is_train and self.use_weather_aug and random.random() > 0.5:
             choice = random.randint(0, 2)
-            if choice == 0:
-                weather_fn = apply_fog
-            elif choice == 1:
-                weather_fn = apply_rain
-            else:
-                weather_fn = apply_snow
+            aug_fn = [apply_fog, apply_rain, apply_snow][choice]
+        weather_fn = aug_fn  # backward compat
 
         for i in self.frame_idxs:
             if i == "s":

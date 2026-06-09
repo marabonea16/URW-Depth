@@ -94,7 +94,8 @@ def evaluate(opt):
         num_ch_enc = [64, 64, 128, 160, 320]
 
 
-        encoder_dict = torch.load(encoder_path)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        encoder_dict = torch.load(encoder_path, map_location=device)
 
         dataset = datasets.KITTIRAWDataset(opt.data_path, filenames,
                                            opt.height, opt.width,
@@ -104,7 +105,7 @@ def evaluate(opt):
 
 
         encoder = networks.build_model(config, img_width=opt.width, img_height=opt.height)
-        
+
 
         depth_decoder = networks.FusionDecoder(
             num_ch_enc,
@@ -114,11 +115,11 @@ def evaluate(opt):
 
         model_dict = encoder.state_dict()
         encoder.load_state_dict({k: v for k, v in encoder_dict.items() if k in model_dict})
-        depth_decoder.load_state_dict(torch.load(decoder_path), strict=False)
+        depth_decoder.load_state_dict(torch.load(decoder_path, map_location=device), strict=False)
 
-        encoder.cuda()
+        encoder.to(device)
         encoder.eval()
-        depth_decoder.cuda()
+        depth_decoder.to(device)
         depth_decoder.eval()
 
         pred_disps = []
@@ -131,7 +132,7 @@ def evaluate(opt):
         with torch.no_grad():
             for data in dataloader:
 
-                input_color = data[("color_MiS", 0, 0)].cuda()
+                input_color = data[("color_MiS", 0, 0)].to(device)
 
                 if opt.post_process:
                     # Post-processed results require each image to have two forward passes

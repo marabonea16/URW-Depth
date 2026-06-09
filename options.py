@@ -61,6 +61,9 @@ class MonodepthOptions:
         self.parser.add_argument("--use_weather_aug",
                                  help="if set, applies random fog/rain/snow augmentation during training",
                                  action="store_true")
+        self.parser.add_argument("--use_corruption_aug",
+                                 help="if set, applies weather + blur + noise augmentation (for KITTI-C robustness)",
+                                 action="store_true")
         self.parser.add_argument("--use_feature_suppression",
                                  help="if set, uncertainty suppresses features before disp prediction",
                                  action="store_true")
