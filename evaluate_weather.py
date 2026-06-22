@@ -324,7 +324,8 @@ def evaluate(opt):
             opt.data_path, filenames, opt.height, opt.width,
             [0], 4, is_train=False, img_ext='.png',
             weather_fn=_weather_fn)
-        dataloader = DataLoader(dataset, 16, shuffle=False,
+        bs = 4 if (opt.height > 256 or opt.width > 768) else 16
+        dataloader = DataLoader(dataset, bs, shuffle=False,
                                 num_workers=2, pin_memory=True, drop_last=False)
 
     # GT depth

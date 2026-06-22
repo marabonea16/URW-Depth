@@ -226,6 +226,15 @@ class MonodepthOptions:
         self.parser.add_argument("--laplacian_nll",
                                  help="use Laplacian NLL loss for calibrated uncertainty (fixes sigma collapse)",
                                  action="store_true")
+        self.parser.add_argument("--reset_uncert_head",
+                                 help="reinitialize uncertconv weight+bias on load (escapes sigmoid "
+                                      "saturation when fine-tuning a checkpoint with collapsed sigma); "
+                                      "also skips loading Adam state",
+                                 action="store_true")
+        self.parser.add_argument("--calib_weight",
+                                 type=float,
+                                 help="weight for MSE uncertainty calibration loss",
+                                 default=1.0)
         self.parser.add_argument("--use_wandb",
                                  help="if set, log training metrics to Weights & Biases",
                                  action="store_true")

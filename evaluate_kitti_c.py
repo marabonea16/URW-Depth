@@ -26,6 +26,11 @@ from utils import readlines
 import datasets
 import networks
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 cv2.setNumThreads(0)
 
 splits_dir = os.path.join(os.path.dirname(__file__), "splits")
@@ -53,26 +58,25 @@ def compute_errors(gt, pred):
     return abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
 
 
-def load_model(weights_folder, device):
+def load_model(weights_folder, device, height=192, width=640, use_feature_suppression=False):
     encoder_path = os.path.join(weights_folder, "encoder.pth")
     decoder_path = os.path.join(weights_folder, "depth.pth")
 
     encoder_dict = torch.load(encoder_path, map_location=device)
 
     class _Opt:
-        img_height = 192
-        img_width = 640
+        img_height = height
+        img_width = width
         encoder = "tiny_vit_5m_22k_distill"
         scales = [0]
-        use_feature_suppression = True
 
     config = get_config(_Opt())
-    encoder = networks.build_model(config, img_width=640, img_height=192)
+    encoder = networks.build_model(config, img_width=width, img_height=height)
     model_dict = encoder.state_dict()
     encoder.load_state_dict({k: v for k, v in encoder_dict.items() if k in model_dict})
 
     num_ch_enc = [64, 64, 128, 160, 320]
-    decoder = networks.FusionDecoder(num_ch_enc, use_feature_suppression=True)
+    decoder = networks.FusionDecoder(num_ch_enc, use_feature_suppression=use_feature_suppression)
     decoder.load_state_dict(torch.load(decoder_path, map_location=device), strict=False)
 
     encoder.to(device).eval()
@@ -80,15 +84,18 @@ def load_model(weights_folder, device):
     return encoder, decoder
 
 
-def evaluate_one(encoder, decoder, data_path, device):
+def evaluate_one(encoder, decoder, data_path, device, height=192, width=640, batch_size=None):
     """Ruleaza modelul pe un subset KITTI-C si returneaza erorile medii."""
     MIN_DEPTH, MAX_DEPTH = 1e-3, 80.0
 
+    if batch_size is None:
+        batch_size = 4 if (height > 256 or width > 768) else 16
+
     filenames = readlines(os.path.join(splits_dir, "eigen", "test_files.txt"))
     dataset = datasets.KITTIRAWDataset(
-        data_path, filenames, 192, 640, [0], 4, is_train=False, img_ext='.png'
+        data_path, filenames, height, width, [0], 4, is_train=False, img_ext='.png'
     )
-    loader = DataLoader(dataset, 16, shuffle=False, num_workers=4,
+    loader = DataLoader(dataset, batch_size, shuffle=False, num_workers=4,
                         pin_memory=True, drop_last=False)
 
     gt_path = os.path.join(splits_dir, "eigen", "gt_depths.npz")
@@ -143,9 +150,14 @@ def main():
                         help="Corruption types. Use 'all' for all 18, 'weather' for weather subset.")
     parser.add_argument("--severities", nargs="+", type=int, default=[1, 2, 3, 4, 5])
     parser.add_argument("--eval_mono", action="store_true", required=True)
+    parser.add_argument("--height", type=int, default=192)
+    parser.add_argument("--width", type=int, default=640)
+    parser.add_argument("--use_feature_suppression", action="store_true")
+    parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--wandb_project", type=str, default="tinydepth")
+    parser.add_argument("--wandb_run_name", type=str, default=None)
     opt = parser.parse_args()
 
-    # expandeaza shortcut-uri
     corruptions = opt.corruptions
     if "all" in corruptions:
         corruptions = ALL_CORRUPTIONS
@@ -154,15 +166,17 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"-> Loading weights from {opt.load_weights_folder}")
-    encoder, decoder = load_model(opt.load_weights_folder, device)
-
-    results = {}  # corruption -> {severity -> errors}
-    header = "  {:>20} | " + " | ".join([f"  sev{s}  " for s in opt.severities])
+    encoder, decoder = load_model(
+        opt.load_weights_folder, device,
+        height=opt.height, width=opt.width,
+        use_feature_suppression=opt.use_feature_suppression
+    )
 
     print(f"\n{'Corruption':>20} | " + " | ".join([f"  sev{s}  " for s in opt.severities]) + " | mean")
     print("-" * (24 + 12 * len(opt.severities) + 10))
 
     all_errors = []
+    results_per_corruption = {}
     for corruption in corruptions:
         sev_errors = []
         for sev in opt.severities:
@@ -170,19 +184,36 @@ def main():
             if not os.path.isdir(data_path):
                 print(f"   [SKIP] {corruption}/sev{sev} not found")
                 continue
-            errs = evaluate_one(encoder, decoder, data_path, device)
+            errs = evaluate_one(encoder, decoder, data_path, device, height=opt.height, width=opt.width, batch_size=getattr(opt, 'batch_size', None))
             sev_errors.append(errs)
             all_errors.append(errs)
 
         if sev_errors:
-            results[corruption] = sev_errors
-            mean_abs = np.mean([e[0] for e in sev_errors])
+            results_per_corruption[corruption] = np.mean([e[0] for e in sev_errors])
+            mean_abs = results_per_corruption[corruption]
             sev_str = " | ".join([f"  {e[0]:.3f}  " for e in sev_errors])
             print(f"  {corruption:>20} | {sev_str} | {mean_abs:.3f}")
 
-    if all_errors:
-        overall = np.array(all_errors).mean(0)
+    overall = np.array(all_errors).mean(0) if all_errors else None
+    if overall is not None:
         print(f"\n{'OVERALL MEAN':>20}   abs_rel={overall[0]:.3f} | sq_rel={overall[1]:.3f} | rmse={overall[2]:.3f} | a1={overall[4]:.3f}")
+
+    if opt.use_wandb and wandb is not None and overall is not None:
+        run_name = opt.wandb_run_name or f"kitti-c-{os.path.basename(opt.load_weights_folder)}"
+        wandb.init(project=opt.wandb_project, name=run_name)
+        log_dict = {
+            "kitti_c/abs_rel":  float(overall[0]),
+            "kitti_c/sq_rel":   float(overall[1]),
+            "kitti_c/rmse":     float(overall[2]),
+            "kitti_c/rmse_log": float(overall[3]),
+            "kitti_c/a1":       float(overall[4]),
+            "kitti_c/a2":       float(overall[5]),
+            "kitti_c/a3":       float(overall[6]),
+        }
+        for corr, abs_rel in results_per_corruption.items():
+            log_dict[f"kitti_c_per/{corr}"] = float(abs_rel)
+        wandb.log(log_dict)
+        wandb.finish()
 
     print("\n-> Done!")
 

@@ -741,13 +741,16 @@ class Trainer:
                 loss_HiS += self.opt.uncert_smoothness * torch.mean(
                     torch.abs(log_s_HiS - log_s_MiS.detach()))
             else:
-                # uncertainty-weighted photometric loss (original):
-                # loss = (1 - sigma.detach()) * photometric * uncert_mask + lambda * sigma
+                # uncertainty-weighted photometric loss:
+                # loss = (1 - sigma.detach()) * photometric + lambda * sigma
+                # (fara hard mask la sigma<0.8: cu sigma calibrat, masca elimina
+                #  total supravegherea in regiuni "natural dificile" - cer, obiecte
+                #  indepartate, ocluzii - care exista si pe imagini curate, nu doar
+                #  sub vreme. Ponderarea (1-sigma) e suficienta si continua.)
                 sigma_HiS = torch.sigmoid(F.interpolate(
                     outputs["out_HiS"][("uncert", 0)], [self.opt.height, self.opt.width],
                     mode="bilinear", align_corners=False))
-                uncert_mask_HiS = (sigma_HiS < 0.8).float()
-                loss_HiS += ((1.0 - sigma_HiS.detach()) * to_optimise_HiS.unsqueeze(1) * uncert_mask_HiS + self.opt.uncert_weight * sigma_HiS).mean()
+                loss_HiS += ((1.0 - sigma_HiS.detach()) * to_optimise_HiS.unsqueeze(1) + self.opt.uncert_weight * sigma_HiS).mean()
                 mean_disp_HiS = disp_HiS.mean(2, True).mean(3, True)
                 norm_disp_HiS = disp_HiS / (mean_disp_HiS + 1e-7)
                 smooth_loss_HiS = get_smooth_loss(norm_disp_HiS, color_HiS)
@@ -757,8 +760,7 @@ class Trainer:
                 sigma_MiS = torch.sigmoid(F.interpolate(
                     outputs["out_MiS"][("uncert", 0)], [self.opt.height, self.opt.width],
                     mode="bilinear", align_corners=False))
-                uncert_mask_MiS = (sigma_MiS < 0.8).float()
-                loss_MiS += ((1.0 - sigma_MiS.detach()) * to_optimise_MiS.unsqueeze(1) * uncert_mask_MiS + self.opt.uncert_weight * sigma_MiS).mean()
+                loss_MiS += ((1.0 - sigma_MiS.detach()) * to_optimise_MiS.unsqueeze(1) + self.opt.uncert_weight * sigma_MiS).mean()
                 mean_disp_MiS = disp_MiS.mean(2, True).mean(3, True)
                 norm_disp_MiS = disp_MiS / (mean_disp_MiS + 1e-7)
                 smooth_loss_MiS = get_smooth_loss(norm_disp_MiS, color_MiS)
@@ -768,8 +770,7 @@ class Trainer:
                 sigma_LoS = torch.sigmoid(F.interpolate(
                     outputs["out_LoS"][("uncert", 0)], [self.opt.height, self.opt.width],
                     mode="bilinear", align_corners=False))
-                uncert_mask_LoS = (sigma_LoS < 0.8).float()
-                loss_LoS += ((1.0 - sigma_LoS.detach()) * to_optimise_LoS.unsqueeze(1) * uncert_mask_LoS + self.opt.uncert_weight * sigma_LoS).mean()
+                loss_LoS += ((1.0 - sigma_LoS.detach()) * to_optimise_LoS.unsqueeze(1) + self.opt.uncert_weight * sigma_LoS).mean()
                 mean_disp_LoS = disp_LoS.mean(2, True).mean(3, True)
                 norm_disp_LoS = disp_LoS / (mean_disp_LoS + 1e-7)
                 smooth_loss_LoS = get_smooth_loss(norm_disp_LoS, color_LoS)
@@ -779,6 +780,16 @@ class Trainer:
                 # consistenta cross-modal: sigma HiS si MiS ar trebui sa fie similare
                 loss_HiS += self.opt.uncert_smoothness * torch.mean(
                     torch.abs(sigma_HiS - sigma_MiS.detach()))
+
+                # MSE calibration: sigma sa fie proportional cu eroarea fotometrica
+                # previne sigma collapse (sigma=0 -> gradient 0 din phototerm)
+                calib_target_HiS = (to_optimise_HiS.detach() / (to_optimise_HiS.detach().mean() + 1e-6)).clamp(0, 1).unsqueeze(1)
+                calib_target_MiS = (to_optimise_MiS.detach() / (to_optimise_MiS.detach().mean() + 1e-6)).clamp(0, 1).unsqueeze(1)
+                calib_target_LoS = (to_optimise_LoS.detach() / (to_optimise_LoS.detach().mean() + 1e-6)).clamp(0, 1).unsqueeze(1)
+                calib_w = getattr(self.opt, "calib_weight", 1.0)
+                loss_HiS += calib_w * F.mse_loss(sigma_HiS, calib_target_HiS)
+                loss_MiS += calib_w * F.mse_loss(sigma_MiS, calib_target_MiS)
+                loss_LoS += calib_w * F.mse_loss(sigma_LoS, calib_target_LoS)
 
 
             # Lcs0
@@ -1113,11 +1124,23 @@ class Trainer:
             model_dict.update(pretrained_dict)
             self.models[n].load_state_dict(model_dict)
 
+        if getattr(self.opt, "reset_uncert_head", False) and "depth" in self.models:
+            # uncertconv incarcat din checkpoint e saturat (raw_uncert ~ -27 -> sigmoid'~1e-12),
+            # gradientul prin sigmoid e practic 0 indiferent de loss-ul de calibrare.
+            # Reinitializam explicit ca sa scapam din saturatie.
+            uncertconv = self.models["depth"].convs[("uncertconv", 0)].conv
+            nn.init.kaiming_normal_(uncertconv.weight, mode="fan_out", nonlinearity="relu")
+            uncertconv.weight.data *= 0.01
+            nn.init.constant_(uncertconv.bias, 0.0)
+            print("Reset uncertconv (weight+bias) to escape sigmoid saturation")
+
         # loading adam state
         optimizer_load_path = os.path.join(self.opt.load_weights_folder, "adam.pth")
-        if os.path.isfile(optimizer_load_path):
+        if os.path.isfile(optimizer_load_path) and not getattr(self.opt, "reset_uncert_head", False):
             print("Loading Adam weights")
             optimizer_dict = torch.load(optimizer_load_path)
             self.model_optimizer.load_state_dict(optimizer_dict)
         else:
-            print("Cannot find Adam weights so Adam is randomly initialized")
+            print("Adam is randomly initialized "
+                  "({})".format("reset_uncert_head" if getattr(self.opt, "reset_uncert_head", False)
+                                 else "no checkpoint found"))

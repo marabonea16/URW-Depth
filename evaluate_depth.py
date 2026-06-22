@@ -100,7 +100,8 @@ def evaluate(opt):
         dataset = datasets.KITTIRAWDataset(opt.data_path, filenames,
                                            opt.height, opt.width,
                                            [0], 4, is_train=False, img_ext='.png')
-        dataloader = DataLoader(dataset, 16, shuffle=False, num_workers=opt.num_workers,
+        bs = 4 if (opt.height > 256 or opt.width > 768) else 16
+        dataloader = DataLoader(dataset, bs, shuffle=False, num_workers=opt.num_workers,
                                 pin_memory=True, drop_last=False)
 
 

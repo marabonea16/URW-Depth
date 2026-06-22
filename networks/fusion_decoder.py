@@ -90,8 +90,8 @@ class FusionDecoder(nn.Module):
 
         self.convs[("dispconv", 0)] = Conv3x3(64, self.num_output_channels)
         self.convs[("uncertconv", 0)] = Conv3x3(64, self.num_output_channels)
-        # initializeaza bias la -2 -> sigmoid(-2)~0.12: modelul porneste confident
-        nn.init.constant_(self.convs[("uncertconv", 0)].conv.bias, -2.0)
+        # bias=0 -> sigmoid(0)=0.5: sigma porneste la mijloc, evita sigma collapse
+        nn.init.constant_(self.convs[("uncertconv", 0)].conv.bias, 0.0)
 
 
 
@@ -174,7 +174,12 @@ class FusionDecoder(nn.Module):
         d = updown_sample(d, 2)
 
 
-        self.outputs[("uncert", 0)] = self.convs[("uncertconv", 0)](d)  # log-variance (raw, no activation)
+        # d.detach(): izoleaza capul de incertitudine de backbone-ul partajat cu
+        # dispconv. Fara detach, pierderile de incertitudine (calibrare MSE,
+        # smoothness, consistenta cross-modal) propaga gradient inapoi prin d
+        # si reshape-uiesc feature-urile folosite si pentru adancime, degradand
+        # acuratetea depth chiar daca masca/calibrarea functioneaza "corect".
+        self.outputs[("uncert", 0)] = self.convs[("uncertconv", 0)](d.detach())  # log-variance (raw, no activation)
         if self.use_feature_suppression:
             # uncertainty-guided feature suppression:
             # sigma suprima feature-urile afectate de weather/occlusion inainte de disp
