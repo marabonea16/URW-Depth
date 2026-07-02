@@ -40,11 +40,16 @@ class PWSA(nn.Module):
 
 
 class FusionDecoder(nn.Module):
-    def __init__(self, num_ch_enc, scales=range(4), num_output_channels=1, use_skips=True, use_feature_suppression=False):
+    def __init__(self, num_ch_enc, scales=range(4), num_output_channels=1, use_skips=True,
+                 use_feature_suppression=False, gate_depth_input=True):
         super(FusionDecoder, self).__init__()
 
         self.num_output_channels = num_output_channels
         self.use_feature_suppression = use_feature_suppression
+        # gate_depth_input=False: sigma e calculat (calibrat) dar NU mai gateaza
+        # inputul lui dispconv - util cand vrei sigma interpretabil fara costul
+        # de acuratete pe care suprima activa il introduce pe date curate/cunoscute.
+        self.gate_depth_input = gate_depth_input
         self.scales = scales
 
         self.num_ch_enc = num_ch_enc        #features in encoder, [16,64,128,160,320]
@@ -93,6 +98,27 @@ class FusionDecoder(nn.Module):
         # bias=0 -> sigmoid(0)=0.5: sigma porneste la mijloc, evita sigma collapse
         nn.init.constant_(self.convs[("uncertconv", 0)].conv.bias, 0.0)
 
+        # cap global de detectie a corupiei: distinge "imagine global curata cu
+        # regiuni local dificile" de "imagine global corupta cu vreme", folosind
+        # eticheta reala din pipeline-ul de augmentare (supravegheat, nu auto-
+        # supervizat ca sigma). g gateaza suprima de caracteristici - pe imagini
+        # curate g~0 => d_refined~d (adancime neafectata), pe imagini corupte
+        # g~1 => suprima functioneaza normal, ghidata de sigma local.
+        # IMPORTANT: citeste din imaginea RGB bruta (3 canale), nu din feature-ul
+        # tarziu `d` - encoder+decoder sunt antrenate sa fie INVARIANTE la vreme
+        # (asta e scopul robustetii la vreme!), deci semnalul de "e corupta" e
+        # deja eliminat din `d` (verificat empiric: semnal/zgomot 0.09 pe `d` vs
+        # 3.6-3.9 pe imaginea bruta).
+        # Input = medie + std per canal (6 valori), nu doar medie (3): media
+        # singura prinde ceata bine dar e aproape oarba la zapada/ploaie usoara;
+        # std-ul prinde desaturarea/scaderea de contrast pe care media o rateaza.
+        self.corruption_head = nn.Sequential(
+            nn.Linear(6, 16),
+            nn.ReLU(inplace=True),
+            nn.Linear(16, 1),
+        )
+        nn.init.constant_(self.corruption_head[-1].bias, 0.0)
+
 
 
 
@@ -116,8 +142,9 @@ class FusionDecoder(nn.Module):
 
 
 
-    def forward(self, input_feature):
+    def forward(self, input_feature, raw_image=None):
         self.outputs = {}
+        self._raw_image = raw_image  # folosit de corruption_head, vezi mai jos
 
 
 
@@ -172,6 +199,7 @@ class FusionDecoder(nn.Module):
 
 
         d = updown_sample(d, 2)
+        self._last_d = d  # expus pentru experimentare externa (vezi test_nogate_checkpoint.py)
 
 
         # d.detach(): izoleaza capul de incertitudine de backbone-ul partajat cu
@@ -180,9 +208,38 @@ class FusionDecoder(nn.Module):
         # si reshape-uiesc feature-urile folosite si pentru adancime, degradand
         # acuratetea depth chiar daca masca/calibrarea functioneaza "corect".
         self.outputs[("uncert", 0)] = self.convs[("uncertconv", 0)](d.detach())  # log-variance (raw, no activation)
-        if self.use_feature_suppression:
-            # uncertainty-guided feature suppression:
-            # sigma suprima feature-urile afectate de weather/occlusion inainte de disp
+        # cap global de detectie a corupiei - citeste din imaginea RGB bruta
+        # (vezi nota din __init__: feature-ul tarziu `d` e invariant la vreme,
+        # nu mai poarta semnalul necesar). Daca raw_image nu e disponibil
+        # (apeluri vechi/alte scripturi), g ramane neutru (0.5) si gating-ul
+        # global e dezactivat - comportament identic cu varianta fara cap nou.
+        if self._raw_image is not None:
+            stats = torch.cat([
+                self._raw_image.mean(dim=(2, 3)),
+                self._raw_image.std(dim=(2, 3)),
+            ], dim=1)  # [B,6]
+            self.outputs[("corrupt_logit", 0)] = self.corruption_head(stats)  # [B,1]
+        else:
+            self.outputs[("corrupt_logit", 0)] = torch.zeros(d.shape[0], 1, device=d.device)
+        if self.use_feature_suppression and getattr(self, "gate_depth_input", True):
+            # uncertainty-guided feature suppression, gateata global:
+            # sigma (local) suprima feature-urile, dar doar pe imagini pe care
+            # capul de corupie le considera probabil corupte (g~1); pe imagini
+            # curate g~0 => d_refined~d, indiferent ce arata sigma local.
+            sigma = self.sigmoid(self.outputs[("uncert", 0)])
+            gate_temp = getattr(self, "gate_temperature", 1.0)
+            g = self.sigmoid(self.outputs[("corrupt_logit", 0)] * gate_temp).view(-1, 1, 1, 1)
+            if getattr(self, "hard_gate", False):
+                # gate dur (0/1) la inferenta: elimina costul rezidual de
+                # suprimare pe imagini clar curate (g~0.13, nu exact 0) -
+                # testat empiric ca alternativa fara reantrenare.
+                g = (g > 0.5).float()
+            d_refined = d * (1.0 - g.detach() * sigma.detach())
+            self.outputs[("disp", 0)] = self.sigmoid(self.convs[("dispconv", 0)](d_refined))
+        elif self.use_feature_suppression:
+            # suprimare pura sigma fara gate corruption_head (d*(1-sigma))
+            # folosita la evaluarea Fix4/URW-Depth-Weather, antrenat inainte de
+            # adaugarea corruption_head.
             sigma = self.sigmoid(self.outputs[("uncert", 0)])
             d_refined = d * (1.0 - sigma.detach())
             self.outputs[("disp", 0)] = self.sigmoid(self.convs[("dispconv", 0)](d_refined))

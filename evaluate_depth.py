@@ -108,9 +108,11 @@ def evaluate(opt):
         encoder = networks.build_model(config, img_width=opt.width, img_height=opt.height)
 
 
+        gate_depth_input = not getattr(opt, "no_suppression_gating", False)
         depth_decoder = networks.FusionDecoder(
             num_ch_enc,
-            use_feature_suppression=getattr(opt, "use_feature_suppression", False))
+            use_feature_suppression=getattr(opt, "use_feature_suppression", False),
+            gate_depth_input=gate_depth_input)
 
 
 
@@ -135,19 +137,20 @@ def evaluate(opt):
 
                 input_color = data[("color_MiS", 0, 0)].to(device)
 
-                if opt.post_process:
-                    # Post-processed results require each image to have two forward passes
-                    input_color = torch.cat((input_color, torch.flip(input_color, [3])), 0)
-
-                output = depth_decoder(encoder(input_color))
+                output = depth_decoder(encoder(input_color), raw_image=input_color)
 
                 # pred_disp, _ = disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
                 pred_disp, _ = disp_to_depth(output[("disp", 0)][:,0,:,:].unsqueeze(1), opt.min_depth, opt.max_depth)
                 pred_disp = pred_disp.cpu()[:, 0].numpy()
 
                 if opt.post_process:
-                    N = pred_disp.shape[0] // 2
-                    pred_disp = batch_post_process_disparity(pred_disp[:N], pred_disp[N:, :, ::-1])
+                    # Flip ensemble: medie simpla cu predictia imaginii orizontal-flipped
+                    # Doua forward pass-uri separate (CASA nu suporta batch dublu concatenat)
+                    input_flip = torch.flip(input_color, [3])
+                    output_flip = depth_decoder(encoder(input_flip), raw_image=input_flip)
+                    pred_disp_flip, _ = disp_to_depth(output_flip[("disp", 0)][:,0,:,:].unsqueeze(1), opt.min_depth, opt.max_depth)
+                    pred_disp_flip_np = torch.flip(pred_disp_flip, [3]).cpu()[:, 0].numpy()
+                    pred_disp = 0.5 * (pred_disp + pred_disp_flip_np)
 
                 pred_disps.append(pred_disp)
 

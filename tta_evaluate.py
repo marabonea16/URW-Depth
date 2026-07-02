@@ -80,9 +80,9 @@ def tta_step(encoder, depth_decoder, pose_encoder, pose_decoder,
     original_state = copy.deepcopy(depth_decoder.state_dict())
 
     # actualizeaza doar ultimul strat (dispconv) - cel mai stabil pentru TTA fara BN
-    # actualizeaza dispconv + uncertconv (capete de output)
-    dispconv_params = (list(depth_decoder.convs[("dispconv", 0)].parameters()) +
-                       list(depth_decoder.convs[("uncertconv", 0)].parameters()))
+    # actualizeaza doar dispconv: sigma ramane calibrat din antrenare
+    # uncertconv NU se actualizeaza (reg_loss pe sigma distorsioneaza ponderarea)
+    dispconv_params = list(depth_decoder.convs[("dispconv", 0)].parameters())
     optimizer = torch.optim.Adam(dispconv_params, lr=tta_lr)
 
     H, W = frame_target.shape[2], frame_target.shape[3]
@@ -135,11 +135,10 @@ def tta_step(encoder, depth_decoder, pose_encoder, pose_decoder,
 
             photo_loss = compute_photometric_loss(reconstructed, frame_target, ssim_fn)  # [1,1,H,W]
 
-            # uncertainty-weighted: pixelii cu sigma mare contribuie mai putin
-            weighted_loss = ((1.0 - sigma.detach()) * photo_loss).mean()
-            # regularizare sigma ca sa nu cada spre 0
-            reg_loss = (0.1 * sigma).mean()
-            total_loss = total_loss + weighted_loss + reg_loss
+            # uncertainty-weighted: sigma detasat (calibrat din antrenare, fix in TTA)
+            weight = (1.0 - sigma.detach())
+            weighted_loss = (weight * photo_loss).sum() / weight.sum().clamp(min=1e-6)
+            total_loss = total_loss + weighted_loss
 
         # consistency: nu lasa modelul sa se departeze prea mult de predictia initiala
         consistency_loss = F.l1_loss(disp, disp_init)
@@ -160,6 +159,29 @@ def tta_step(encoder, depth_decoder, pose_encoder, pose_decoder,
     depth_decoder.load_state_dict(original_state)
     depth_decoder.train()
 
+    return disp_final
+
+
+def tta_step_with_flip(encoder, depth_decoder, pose_encoder, pose_decoder,
+                       frame_target, frame_prev, frame_next,
+                       K, inv_K, ssim_fn, backproject, project,
+                       tta_lr, n_steps, device, consistency_weight=1.0):
+    """TTA fotometric + flip ensemble: adapteaza modelul, apoi medie cu predictia flipped."""
+    disp_adapted = tta_step(
+        encoder, depth_decoder, pose_encoder, pose_decoder,
+        frame_target, frame_prev, frame_next,
+        K, inv_K, ssim_fn, backproject, project,
+        tta_lr, n_steps, device, consistency_weight)
+
+    # Flip ensemble pe modelul adaptat
+    depth_decoder.eval()
+    with torch.no_grad():
+        frame_flip = torch.flip(frame_target, [3])
+        feats_flip = encoder(frame_flip)
+        out_flip = depth_decoder(feats_flip)
+        disp_flip, _ = disp_to_depth(out_flip[("disp", 0)][:, 0:1], 0.1, 100.0)
+        disp_final = 0.5 * (disp_adapted + torch.flip(disp_flip, [3]))
+    depth_decoder.train()
     return disp_final
 
 
@@ -263,18 +285,30 @@ def evaluate(opt):
         except (FileNotFoundError, Exception):
             has_neighbors = False
 
+        use_flip = getattr(opt, "flip_ensemble", False)
         if has_neighbors:
-            disp_adapted = tta_step(
-                encoder, depth_decoder, pose_encoder, pose_decoder,
-                frame_target, frame_prev, frame_next,
-                K, inv_K, ssim_fn, backproject, project,
-                tta_lr=opt.tta_lr, n_steps=opt.tta_steps, device=device)
+            if use_flip:
+                disp_adapted = tta_step_with_flip(
+                    encoder, depth_decoder, pose_encoder, pose_decoder,
+                    frame_target, frame_prev, frame_next,
+                    K, inv_K, ssim_fn, backproject, project,
+                    tta_lr=opt.tta_lr, n_steps=opt.tta_steps, device=device)
+            else:
+                disp_adapted = tta_step(
+                    encoder, depth_decoder, pose_encoder, pose_decoder,
+                    frame_target, frame_prev, frame_next,
+                    K, inv_K, ssim_fn, backproject, project,
+                    tta_lr=opt.tta_lr, n_steps=opt.tta_steps, device=device)
         else:
-            # fara vecini: predictie normala fara TTA
             depth_decoder.eval()
             with torch.no_grad():
                 out = depth_decoder(encoder(frame_target))
-            disp_adapted, _ = disp_to_depth(out[("disp", 0)][:, 0:1], 0.1, 100.0)
+                disp_adapted, _ = disp_to_depth(out[("disp", 0)][:, 0:1], 0.1, 100.0)
+                if use_flip:
+                    frame_flip = torch.flip(frame_target, [3])
+                    out_flip = depth_decoder(encoder(frame_flip))
+                    disp_flip, _ = disp_to_depth(out_flip[("disp", 0)][:, 0:1], 0.1, 100.0)
+                    disp_adapted = 0.5 * (disp_adapted + torch.flip(disp_flip, [3]))
             depth_decoder.train()
 
         pred_disp = disp_adapted.cpu().numpy()[:, 0]  # [1,H,W]
@@ -367,6 +401,8 @@ if __name__ == "__main__":
     options = MonodepthOptions()
     options.parser.add_argument("--tta_steps", type=int, default=5,
                                 help="numar de pasi gradient la TTA")
+    options.parser.add_argument("--flip_ensemble", action="store_true",
+                                help="TTA flip ensemble pe modelul adaptat dupa pasii de gradient")
     options.parser.add_argument("--tta_lr", type=float, default=1e-4,
                                 help="learning rate pentru TTA")
     evaluate(options.parse())

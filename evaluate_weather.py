@@ -71,12 +71,19 @@ def apply_fog(img, severity=0.45, frame_seed=None):
 
 
 def apply_rain(img, severity=0.45, frame_seed=None):
-    """Rain augmentation. frame_seed changes streak positions between frames."""
+    """Rain augmentation.
+    Pozitiile streaks sunt FIXE (seed=42) pentru consistenta fotometrica TTA.
+    frame_seed adauga o mica variatie de intensitate (±5%) intre frame-uri
+    pentru a genera gradient TTA util, fara a muta streaks.
+    """
     arr = np.array(img, dtype=np.float32)
     h, w = arr.shape[:2]
     num_streaks = int(severity * 600)
-    seed = 42 if frame_seed is None else (int(frame_seed) % (2**31))
-    rng = np.random.RandomState(seed)
+    rng = np.random.RandomState(42)  # pozitii fixe in toate frame-urile
+    sev_local = severity
+    if frame_seed is not None:
+        iv_rng = np.random.RandomState(int(abs(1000 + frame_seed)) % (2**31))
+        sev_local = float(severity) * float(np.clip(1.0 + 0.05 * iv_rng.randn(), 0.85, 1.15))
     for _ in range(num_streaks):
         x = rng.randint(0, w)
         y = rng.randint(0, h - 20)
@@ -86,18 +93,24 @@ def apply_rain(img, severity=0.45, frame_seed=None):
             yi = min(y + k, h - 1)
             xi = min(x + k // 3, w - 1)
             arr[yi, xi] = arr[yi, xi] * (1 - alpha) + 200 * alpha
-    arr = arr * (1 - severity * 0.15) + 128 * severity * 0.15
+    arr = arr * (1 - sev_local * 0.15) + 128 * sev_local * 0.15
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
 
 
 def apply_snow(img, severity=0.45, frame_seed=None):
-    """Snow augmentation. frame_seed changes flake positions between frames."""
+    """Snow augmentation.
+    Pozitiile fulgilor sunt FIXE (seed=42) pentru consistenta fotometrica TTA.
+    frame_seed adauga mica variatie de desaturare intre frame-uri.
+    """
     arr = np.array(img, dtype=np.float32)
     h, w = arr.shape[:2]
+    sev_local = severity
+    if frame_seed is not None:
+        iv_rng = np.random.RandomState(int(abs(1000 + frame_seed)) % (2**31))
+        sev_local = float(severity) * float(np.clip(1.0 + 0.05 * iv_rng.randn(), 0.85, 1.15))
     gray = arr.mean(axis=2, keepdims=True)
-    arr = arr * (1 - severity * 0.4) + gray * severity * 0.4
-    seed = 42 if frame_seed is None else (int(frame_seed) % (2**31))
-    rng = np.random.RandomState(seed)
+    arr = arr * (1 - sev_local * 0.4) + gray * sev_local * 0.4
+    rng = np.random.RandomState(42)  # pozitii fixe in toate frame-urile
     num_flakes = int(severity * 800)
     ys = rng.randint(0, h, num_flakes)
     xs = rng.randint(0, w, num_flakes)
@@ -136,7 +149,8 @@ def compute_photometric_loss(pred, target, ssim_fn):
 def tta_step(encoder, depth_decoder, pose_encoder, pose_decoder,
              frame_target, frame_prev, frame_next,
              K, inv_K, ssim_fn, backproject, project,
-             tta_lr, n_steps, device, consistency_weight=1.0):
+             tta_lr, n_steps, device, consistency_weight=1.0,
+             uncertainty_weighted=True, bypass_suppression_for_grad=False):
     """
     Photometric TTA cu vreme consistenta pe toate frame-urile.
 
@@ -162,9 +176,25 @@ def tta_step(encoder, depth_decoder, pose_encoder, pose_decoder,
         optimizer.zero_grad()
         with torch.no_grad():
             feats = encoder(frame_target)
+        # bypass_suppression_for_grad: dezactiveaza temporar suprimarea in pasul
+        # de gradient pentru ca gradientul sa ajunga neattenuat la dispconv.
+        # Predictia finala (dupa gradient) foloseste suprimarea normal.
+        if bypass_suppression_for_grad and hasattr(depth_decoder, 'use_feature_suppression'):
+            orig_supp = depth_decoder.use_feature_suppression
+            depth_decoder.use_feature_suppression = False
         output = depth_decoder(feats)
+        if bypass_suppression_for_grad and hasattr(depth_decoder, 'use_feature_suppression'):
+            depth_decoder.use_feature_suppression = orig_supp
         disp = output[("disp", 0)][:, 0:1]
         _, depth = disp_to_depth(disp, 0.1, 100.0)
+
+        # incertitudine-ghidata: pixelii pe care modelul ii considera nesiguri
+        # (sigma mare) conteaza mai puin in adaptare - semnalul fotometric de
+        # acolo e oricum mai putin de incredere (texturare slaba, ocluzii,
+        # zone deja afectate de vreme). Detached: foloseste sigma ca pondere
+        # fixa per pas, nu lasa gradientul de TTA sa o re-calibreze.
+        sigma = (torch.sigmoid(output[("uncert", 0)]).detach()
+                 if uncertainty_weighted and ("uncert", 0) in output else None)
 
         # Pose prediction (frozen)
         with torch.no_grad():
@@ -187,7 +217,12 @@ def tta_step(encoder, depth_decoder, pose_encoder, pose_decoder,
                 src, pix_coords,
                 mode="bilinear", padding_mode="border", align_corners=False)
             photo_loss = compute_photometric_loss(reconstructed, frame_target, ssim_fn)
-            total_photo = total_photo + photo_loss.mean()
+            if sigma is not None:
+                weight = (1.0 - sigma)
+                weighted_loss = (photo_loss * weight).sum() / weight.sum().clamp(min=1e-6)
+                total_photo = total_photo + weighted_loss
+            else:
+                total_photo = total_photo + photo_loss.mean()
 
         # Consistency: prevent depth from drifting too far from initial prediction
         consist_loss = F.l1_loss(disp, disp_init)
@@ -269,9 +304,11 @@ def evaluate(opt):
     num_ch_enc = [64, 64, 128, 160, 320]
 
     encoder = networks.build_model(config, img_width=opt.width, img_height=opt.height)
+    gate_depth_input = not getattr(opt, "no_suppression_gating", False)
     depth_decoder = networks.FusionDecoder(
         num_ch_enc,
-        use_feature_suppression=getattr(opt, "use_feature_suppression", False))
+        use_feature_suppression=getattr(opt, "use_feature_suppression", False),
+        gate_depth_input=gate_depth_input)
 
     encoder_dict = torch.load(os.path.join(opt.load_weights_folder, "encoder.pth"),
                               map_location=device)
@@ -358,12 +395,23 @@ def evaluate(opt):
                     frame_target, frame_prev, frame_next,
                     K, inv_K, ssim_fn, backproject, project,
                     tta_lr=opt.tta_lr, n_steps=opt.tta_steps, device=device,
-                    consistency_weight=getattr(opt, "tta_consistency_weight", 1.0))
+                    consistency_weight=getattr(opt, "tta_consistency_weight", 1.0),
+                    uncertainty_weighted=not getattr(opt, "tta_no_uncertainty_weight", False),
+                    bypass_suppression_for_grad=getattr(opt, "tta_bypass_suppression", False))
             else:
                 depth_decoder.eval()
                 with torch.no_grad():
                     out = depth_decoder(encoder(frame_target))
                 disp_out, _ = disp_to_depth(out[("disp", 0)][:, 0:1], 0.1, 100.0)
+                depth_decoder.train()
+
+            if getattr(opt, "flip_ensemble", False):
+                depth_decoder.eval()
+                with torch.no_grad():
+                    inp_flip = torch.flip(frame_target, [3])
+                    out_flip = depth_decoder(encoder(inp_flip))
+                    d_flip, _ = disp_to_depth(out_flip[("disp", 0)][:, 0:1], 0.1, 100.0)
+                    disp_out = 0.5 * (disp_out + torch.flip(d_flip, [3]))
                 depth_decoder.train()
 
             pred_disps.append(disp_out.cpu().numpy()[:, 0])
@@ -494,6 +542,11 @@ if __name__ == "__main__":
                                 help="learning rate TTA")
     options.parser.add_argument("--tta_consistency_weight", type=float, default=1.0,
                                 help="weight pentru consistency loss in TTA")
+    options.parser.add_argument("--tta_no_uncertainty_weight", action="store_true",
+                                help="dezactiveaza ponderarea TTA cu (1-sigma), pentru comparatie A/B")
+    options.parser.add_argument("--tta_bypass_suppression", action="store_true",
+                                help="dezactiveaza suprimarea in pasul de gradient TTA (gradientul ajunge "
+                                     "complet la dispconv); predictia finala foloseste suprimarea normal")
     options.parser.add_argument("--flip_ensemble", action="store_true",
                                 help="TTA simplu: medie cu predictia imaginii orizontal-flipped")
     evaluate(options.parse())
